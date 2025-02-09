@@ -64,6 +64,7 @@ const openai = new openai_1.default({
 function getPRDetails() {
     var _a, _b;
     return __awaiter(this, void 0, void 0, function* () {
+        console.log("Process env:", process.env);
         const { repository, number } = JSON.parse((0, fs_1.readFileSync)(process.env.GITEA_EVENT_PATH || "", "utf8"));
         const prResponse = yield gitea.repos.repoGetPullRequest(repository.owner.login, repository.name, number);
         console.log("PR Response:", prResponse);

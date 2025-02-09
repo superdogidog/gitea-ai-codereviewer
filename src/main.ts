@@ -30,6 +30,7 @@ interface PRDetails {
 }
 
 async function getPRDetails(): Promise<PRDetails> {
+  console.log("Process env:", process.env);
   const { repository, number } = JSON.parse(
     readFileSync(process.env.GITEA_EVENT_PATH || "", "utf8")
   );
