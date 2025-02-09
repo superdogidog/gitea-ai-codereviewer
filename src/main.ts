@@ -60,7 +60,6 @@ async function getDiff(
   repo: string,
   pull_number: number
 ): Promise<string | null> {
-  // Using raw API endpoint for diff since gitea-js doesn't have a direct method
   const response = await fetch(
     `${GITEA_API_URL}/repos/${owner}/${repo}/pulls/${pull_number}.diff`,
     {
@@ -220,28 +219,7 @@ async function main() {
 
   console.log("Event data:", eventData);
 
-  if (eventData.action === "opened") {
-    diff = await getDiff(
-      prDetails.owner,
-      prDetails.repo,
-      prDetails.pull_number
-    );
-  } else if (eventData.action === "synchronized") {
-    const git = simpleGit();
-
-    const newBaseSha = eventData.head.sha;
-    const newHeadSha = eventData.base.sha;
-
-    try {
-      diff = await git.diff([`${newBaseSha}...${newHeadSha}`]);
-    } catch (error) {
-      console.error("Error getting diff with simple-git:", error);
-      diff = null;
-    }
-  } else {
-    console.log("Unsupported event:", process.env.GITHUB_EVENT_NAME);
-    return;
-  }
+  diff = await getDiff(prDetails.owner, prDetails.repo, prDetails.pull_number);
 
   if (!diff) {
     console.log("No diff found");

@@ -92,7 +92,6 @@ function getPRDetails() {
 }
 function getDiff(owner, repo, pull_number) {
     return __awaiter(this, void 0, void 0, function* () {
-        // Using raw API endpoint for diff since gitea-js doesn't have a direct method
         const response = yield (0, cross_fetch_1.fetch)(`${GITEA_API_URL}/repos/${owner}/${repo}/pulls/${pull_number}.diff`, {
             headers: {
                 Authorization: `token ${GITEA_TOKEN}`,
@@ -224,25 +223,7 @@ function main() {
         let diff;
         const eventData = JSON.parse((0, fs_1.readFileSync)((_a = process.env.GITHUB_EVENT_PATH) !== null && _a !== void 0 ? _a : "", "utf8"));
         console.log("Event data:", eventData);
-        if (eventData.action === "opened") {
-            diff = yield getDiff(prDetails.owner, prDetails.repo, prDetails.pull_number);
-        }
-        else if (eventData.action === "synchronized") {
-            const git = simpleGit();
-            const newBaseSha = eventData.head.sha;
-            const newHeadSha = eventData.base.sha;
-            try {
-                diff = yield git.diff([`${newBaseSha}...${newHeadSha}`]);
-            }
-            catch (error) {
-                console.error("Error getting diff with simple-git:", error);
-                diff = null;
-            }
-        }
-        else {
-            console.log("Unsupported event:", process.env.GITHUB_EVENT_NAME);
-            return;
-        }
+        diff = yield getDiff(prDetails.owner, prDetails.repo, prDetails.pull_number);
         if (!diff) {
             console.log("No diff found");
             return;
