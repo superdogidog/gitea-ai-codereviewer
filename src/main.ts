@@ -31,9 +31,12 @@ interface PRDetails {
 
 async function getPRDetails(): Promise<PRDetails> {
   console.log("Process env:", process.env);
-  const { repository, number } = JSON.parse(
+  const { repository, number, ...rest } = JSON.parse(
     readFileSync(process.env.GITHUB_EVENT_PATH || "", "utf8")
   );
+
+  console.log("Repository:", { ...rest, repository, number });
+  console.log("Gitea:", GITEA_API_URL, GITEA_TOKEN);
 
   const prResponse = await gitea.repos.repoGetPullRequest(
     repository.owner.login,
