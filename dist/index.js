@@ -49,8 +49,8 @@ const gitea_js_1 = __nccwpck_require__(6814);
 const cross_fetch_1 = __nccwpck_require__(9805);
 const parse_diff_1 = __importDefault(__nccwpck_require__(4833));
 const { simpleGit } = __nccwpck_require__(9103);
-const GITEA_TOKEN = core.getInput("GITEA_TOKEN");
-const GITEA_API_URL = core.getInput("GITEA_API_URL");
+const GITEA_TOKEN = core.getInput("API_TOKEN_GITEA");
+const GITEA_API_URL = core.getInput("API_URL_GITEA");
 const OPENAI_API_KEY = core.getInput("OPENAI_API_KEY");
 const OPENAI_API_MODEL = core.getInput("OPENAI_API_MODEL");
 // Initialize Gitea API client

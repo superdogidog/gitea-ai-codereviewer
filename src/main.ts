@@ -6,8 +6,8 @@ import { fetch } from "cross-fetch";
 import parseDiff, { Chunk, File } from "parse-diff";
 const { simpleGit } = require("simple-git");
 
-const GITEA_TOKEN: string = core.getInput("GITEA_TOKEN");
-const GITEA_API_URL: string = core.getInput("GITEA_API_URL");
+const GITEA_TOKEN: string = core.getInput("API_TOKEN_GITEA");
+const GITEA_API_URL: string = core.getInput("API_URL_GITEA");
 const OPENAI_API_KEY: string = core.getInput("OPENAI_API_KEY");
 const OPENAI_API_MODEL: string = core.getInput("OPENAI_API_MODEL");
 
