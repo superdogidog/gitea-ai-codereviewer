@@ -229,8 +229,8 @@ function main() {
         }
         else if (eventData.action === "synchronized") {
             const git = simpleGit();
-            const newBaseSha = eventData.before;
-            const newHeadSha = eventData.after;
+            const newBaseSha = eventData.head.sha;
+            const newHeadSha = eventData.base.sha;
             try {
                 diff = yield git.diff([`${newBaseSha}...${newHeadSha}`]);
             }
