@@ -61,7 +61,7 @@ async function getDiff(
   pull_number: number
 ): Promise<string | null> {
   const response = await fetch(
-    `${GITEA_API_URL}/repos/${owner}/${repo}/pulls/${pull_number}.diff`,
+    `${GITEA_API_URL}/api/v1/repos/${owner}/${repo}/pulls/${pull_number}.diff`,
     {
       headers: {
         Authorization: `token ${GITEA_TOKEN}`,
