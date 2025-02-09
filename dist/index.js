@@ -97,7 +97,13 @@ function getDiff(owner, repo, pull_number) {
                 Authorization: `token ${GITEA_TOKEN}`,
             },
         });
-        return response.ok ? yield response.text() : null;
+        console.log("Response:", response);
+        if (!response.ok) {
+            console.error("Error fetching diff:", response.statusText);
+            return null;
+        }
+        const diff = yield response.text();
+        return diff;
     });
 }
 function analyzeCode(parsedDiff, prDetails) {

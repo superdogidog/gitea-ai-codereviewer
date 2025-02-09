@@ -69,7 +69,16 @@ async function getDiff(
     }
   );
 
-  return response.ok ? await response.text() : null;
+  console.log("Response:", response);
+
+  if (!response.ok) {
+    console.error("Error fetching diff:", response.statusText);
+    return null;
+  }
+
+  const diff = await response.text();
+
+  return diff;
 }
 
 async function analyzeCode(
