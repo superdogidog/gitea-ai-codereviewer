@@ -32,7 +32,7 @@ interface PRDetails {
 async function getPRDetails(): Promise<PRDetails> {
   console.log("Process env:", process.env);
   const { repository, number } = JSON.parse(
-    readFileSync(process.env.GITEA_EVENT_PATH || "", "utf8")
+    readFileSync(process.env.GITHUB_EVENT_PATH || "", "utf8")
   );
 
   const prResponse = await gitea.repos.repoGetPullRequest(
@@ -212,7 +212,7 @@ async function main() {
   const prDetails = await getPRDetails();
   let diff: string | null;
   const eventData = JSON.parse(
-    readFileSync(process.env.GITEA_EVENT_PATH ?? "", "utf8")
+    readFileSync(process.env.GITHUB_EVENT_PATH ?? "", "utf8")
   );
 
   console.log("Event data:", eventData);
@@ -236,7 +236,7 @@ async function main() {
       diff = null;
     }
   } else {
-    console.log("Unsupported event:", process.env.GITEA_EVENT_NAME);
+    console.log("Unsupported event:", process.env.GITHUB_EVENT_NAME);
     return;
   }
 

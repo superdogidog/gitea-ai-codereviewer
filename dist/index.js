@@ -65,7 +65,7 @@ function getPRDetails() {
     var _a, _b;
     return __awaiter(this, void 0, void 0, function* () {
         console.log("Process env:", process.env);
-        const { repository, number } = JSON.parse((0, fs_1.readFileSync)(process.env.GITEA_EVENT_PATH || "", "utf8"));
+        const { repository, number } = JSON.parse((0, fs_1.readFileSync)(process.env.GITHUB_EVENT_PATH || "", "utf8"));
         const prResponse = yield gitea.repos.repoGetPullRequest(repository.owner.login, repository.name, number);
         console.log("PR Response:", prResponse);
         return {
@@ -209,7 +209,7 @@ function main() {
     return __awaiter(this, void 0, void 0, function* () {
         const prDetails = yield getPRDetails();
         let diff;
-        const eventData = JSON.parse((0, fs_1.readFileSync)((_a = process.env.GITEA_EVENT_PATH) !== null && _a !== void 0 ? _a : "", "utf8"));
+        const eventData = JSON.parse((0, fs_1.readFileSync)((_a = process.env.GITHUB_EVENT_PATH) !== null && _a !== void 0 ? _a : "", "utf8"));
         console.log("Event data:", eventData);
         if (eventData.action === "opened") {
             diff = yield getDiff(prDetails.owner, prDetails.repo, prDetails.pull_number);
@@ -227,7 +227,7 @@ function main() {
             }
         }
         else {
-            console.log("Unsupported event:", process.env.GITEA_EVENT_NAME);
+            console.log("Unsupported event:", process.env.GITHUB_EVENT_NAME);
             return;
         }
         if (!diff) {
