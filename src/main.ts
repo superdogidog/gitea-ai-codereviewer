@@ -1,15 +1,21 @@
 import { readFileSync } from "fs";
 import * as core from "@actions/core";
 import OpenAI from "openai";
-import { Octokit } from "@octokit/rest";
+import { giteaApi } from "gitea-js";
+import { fetch } from "cross-fetch";
 import parseDiff, { Chunk, File } from "parse-diff";
-import minimatch from "minimatch";
+const { simpleGit } = require("simple-git");
 
-const GITHUB_TOKEN: string = core.getInput("GITHUB_TOKEN");
+const GITEA_TOKEN: string = core.getInput("GITEA_TOKEN");
+const GITEA_API_URL: string = core.getInput("GITEA_API_URL");
 const OPENAI_API_KEY: string = core.getInput("OPENAI_API_KEY");
 const OPENAI_API_MODEL: string = core.getInput("OPENAI_API_MODEL");
 
-const octokit = new Octokit({ auth: GITHUB_TOKEN });
+// Initialize Gitea API client
+const gitea = giteaApi(GITEA_API_URL, {
+  token: GITEA_TOKEN,
+  customFetch: fetch,
+});
 
 const openai = new OpenAI({
   apiKey: OPENAI_API_KEY,
@@ -25,13 +31,17 @@ interface PRDetails {
 
 async function getPRDetails(): Promise<PRDetails> {
   const { repository, number } = JSON.parse(
-    readFileSync(process.env.GITHUB_EVENT_PATH || "", "utf8")
+    readFileSync(process.env.GITEA_EVENT_PATH || "", "utf8")
   );
-  const prResponse = await octokit.pulls.get({
-    owner: repository.owner.login,
-    repo: repository.name,
-    pull_number: number,
-  });
+
+  const prResponse = await gitea.repos.repoGetPullRequest(
+    repository.owner.login,
+    repository.name,
+    number
+  );
+
+  console.log("PR Response:", prResponse);
+
   return {
     owner: repository.owner.login,
     repo: repository.name,
@@ -46,14 +56,17 @@ async function getDiff(
   repo: string,
   pull_number: number
 ): Promise<string | null> {
-  const response = await octokit.pulls.get({
-    owner,
-    repo,
-    pull_number,
-    mediaType: { format: "diff" },
-  });
-  // @ts-expect-error - response.data is a string
-  return response.data;
+  // Using raw API endpoint for diff since gitea-js doesn't have a direct method
+  const response = await fetch(
+    `${GITEA_API_URL}/repos/${owner}/${repo}/pulls/${pull_number}.diff`,
+    {
+      headers: {
+        Authorization: `token ${GITEA_TOKEN}`,
+      },
+    }
+  );
+
+  return response.ok ? await response.text() : null;
 }
 
 async function analyzeCode(
@@ -83,7 +96,7 @@ function createPrompt(file: File, chunk: Chunk, prDetails: PRDetails): string {
 - Provide the response in following JSON format:  {"reviews": [{"lineNumber":  <line_number>, "reviewComment": "<review comment>"}]}
 - Do not give positive comments or compliments.
 - Provide comments and suggestions ONLY if there is something to improve, otherwise "reviews" should be an empty array.
-- Write the comment in GitHub Markdown format.
+- Write the comment in Markdown format.
 - Use the given description only for the overall context and only comment the code.
 - IMPORTANT: NEVER suggest adding comments to the code.
 
@@ -103,9 +116,19 @@ Git diff to review:
 \`\`\`diff
 ${chunk.content}
 ${chunk.changes
-  // @ts-expect-error - ln and ln2 exists where needed
-  .map((c) => `${c.ln ? c.ln : c.ln2} ${c.content}`)
-  .join("\n")}
+  .map((c) => {
+    let lineNumber;
+    if (c.type === "normal") {
+      lineNumber = c.ln2;
+    } else if (c.type === "add") {
+      lineNumber = c.ln;
+    } else if (c.type === "del") {
+      lineNumber = c.ln;
+    }
+
+    return `${lineNumber} ${c.content}`;
+  })
+  .join("\n")} 
 \`\`\`
 `;
 }
@@ -126,7 +149,6 @@ async function getAIResponse(prompt: string): Promise<Array<{
   try {
     const response = await openai.chat.completions.create({
       ...queryConfig,
-      // return JSON if the model supports it:
       ...(OPENAI_API_MODEL === "gpt-4-1106-preview"
         ? { response_format: { type: "json_object" } }
         : {}),
@@ -172,21 +194,27 @@ async function createReviewComment(
   pull_number: number,
   comments: Array<{ body: string; path: string; line: number }>
 ): Promise<void> {
-  await octokit.pulls.createReview({
-    owner,
-    repo,
-    pull_number,
-    comments,
-    event: "COMMENT",
-  });
+  // Create review comments one by one
+  // for (const comment of comments) {
+  //   await gitea.repos.commentcreatePullReviewComment({
+  //     owner,
+  //     repo,
+  //     index: pull_number,
+  //     body: comment.body,
+  //     path: comment.path,
+  //     line: comment.line,
+  //   });
+  // }
 }
 
 async function main() {
   const prDetails = await getPRDetails();
   let diff: string | null;
   const eventData = JSON.parse(
-    readFileSync(process.env.GITHUB_EVENT_PATH ?? "", "utf8")
+    readFileSync(process.env.GITEA_EVENT_PATH ?? "", "utf8")
   );
+
+  console.log("Event data:", eventData);
 
   if (eventData.action === "opened") {
     diff = await getDiff(
@@ -194,23 +222,20 @@ async function main() {
       prDetails.repo,
       prDetails.pull_number
     );
-  } else if (eventData.action === "synchronize") {
+  } else if (eventData.action === "synchronized") {
+    const git = simpleGit();
+
     const newBaseSha = eventData.before;
     const newHeadSha = eventData.after;
 
-    const response = await octokit.repos.compareCommits({
-      headers: {
-        accept: "application/vnd.github.v3.diff",
-      },
-      owner: prDetails.owner,
-      repo: prDetails.repo,
-      base: newBaseSha,
-      head: newHeadSha,
-    });
-
-    diff = String(response.data);
+    try {
+      diff = await git.diff([`${newBaseSha}...${newHeadSha}`]);
+    } catch (error) {
+      console.error("Error getting diff with simple-git:", error);
+      diff = null;
+    }
   } else {
-    console.log("Unsupported event:", process.env.GITHUB_EVENT_NAME);
+    console.log("Unsupported event:", process.env.GITEA_EVENT_NAME);
     return;
   }
 
@@ -221,18 +246,20 @@ async function main() {
 
   const parsedDiff = parseDiff(diff);
 
-  const excludePatterns = core
-    .getInput("exclude")
-    .split(",")
-    .map((s) => s.trim());
+  console.log("Parsed diff:", parsedDiff);
 
-  const filteredDiff = parsedDiff.filter((file) => {
-    return !excludePatterns.some((pattern) =>
-      minimatch(file.to ?? "", pattern)
-    );
-  });
+  // const excludePatterns = core
+  //   .getInput("exclude")
+  //   .split(",")
+  //   .map((s) => s.trim());
 
-  const comments = await analyzeCode(filteredDiff, prDetails);
+  // const filteredDiff = parsedDiff.filter((file) => {
+  //   return !excludePatterns.some((pattern) =>
+  //     minimatch(file.to ?? "", pattern)
+  //   );
+  // });
+
+  const comments = await analyzeCode(parsedDiff, prDetails);
   if (comments.length > 0) {
     await createReviewComment(
       prDetails.owner,

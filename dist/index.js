@@ -45,25 +45,28 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 const fs_1 = __nccwpck_require__(7147);
 const core = __importStar(__nccwpck_require__(2186));
 const openai_1 = __importDefault(__nccwpck_require__(47));
-const rest_1 = __nccwpck_require__(5375);
+const gitea_js_1 = __nccwpck_require__(6814);
+const cross_fetch_1 = __nccwpck_require__(9805);
 const parse_diff_1 = __importDefault(__nccwpck_require__(4833));
-const minimatch_1 = __importDefault(__nccwpck_require__(2002));
-const GITHUB_TOKEN = core.getInput("GITHUB_TOKEN");
+const { simpleGit } = __nccwpck_require__(9103);
+const GITEA_TOKEN = core.getInput("GITEA_TOKEN");
+const GITEA_API_URL = core.getInput("GITEA_API_URL");
 const OPENAI_API_KEY = core.getInput("OPENAI_API_KEY");
 const OPENAI_API_MODEL = core.getInput("OPENAI_API_MODEL");
-const octokit = new rest_1.Octokit({ auth: GITHUB_TOKEN });
+// Initialize Gitea API client
+const gitea = (0, gitea_js_1.giteaApi)(GITEA_API_URL, {
+    token: GITEA_TOKEN,
+    customFetch: cross_fetch_1.fetch,
+});
 const openai = new openai_1.default({
     apiKey: OPENAI_API_KEY,
 });
 function getPRDetails() {
     var _a, _b;
     return __awaiter(this, void 0, void 0, function* () {
-        const { repository, number } = JSON.parse((0, fs_1.readFileSync)(process.env.GITHUB_EVENT_PATH || "", "utf8"));
-        const prResponse = yield octokit.pulls.get({
-            owner: repository.owner.login,
-            repo: repository.name,
-            pull_number: number,
-        });
+        const { repository, number } = JSON.parse((0, fs_1.readFileSync)(process.env.GITEA_EVENT_PATH || "", "utf8"));
+        const prResponse = yield gitea.repos.repoGetPullRequest(repository.owner.login, repository.name, number);
+        console.log("PR Response:", prResponse);
         return {
             owner: repository.owner.login,
             repo: repository.name,
@@ -75,14 +78,13 @@ function getPRDetails() {
 }
 function getDiff(owner, repo, pull_number) {
     return __awaiter(this, void 0, void 0, function* () {
-        const response = yield octokit.pulls.get({
-            owner,
-            repo,
-            pull_number,
-            mediaType: { format: "diff" },
+        // Using raw API endpoint for diff since gitea-js doesn't have a direct method
+        const response = yield (0, cross_fetch_1.fetch)(`${GITEA_API_URL}/repos/${owner}/${repo}/pulls/${pull_number}.diff`, {
+            headers: {
+                Authorization: `token ${GITEA_TOKEN}`,
+            },
         });
-        // @ts-expect-error - response.data is a string
-        return response.data;
+        return response.ok ? yield response.text() : null;
     });
 }
 function analyzeCode(parsedDiff, prDetails) {
@@ -110,7 +112,7 @@ function createPrompt(file, chunk, prDetails) {
 - Provide the response in following JSON format:  {"reviews": [{"lineNumber":  <line_number>, "reviewComment": "<review comment>"}]}
 - Do not give positive comments or compliments.
 - Provide comments and suggestions ONLY if there is something to improve, otherwise "reviews" should be an empty array.
-- Write the comment in GitHub Markdown format.
+- Write the comment in Markdown format.
 - Use the given description only for the overall context and only comment the code.
 - IMPORTANT: NEVER suggest adding comments to the code.
 
@@ -128,9 +130,20 @@ Git diff to review:
 \`\`\`diff
 ${chunk.content}
 ${chunk.changes
-        // @ts-expect-error - ln and ln2 exists where needed
-        .map((c) => `${c.ln ? c.ln : c.ln2} ${c.content}`)
-        .join("\n")}
+        .map((c) => {
+        let lineNumber;
+        if (c.type === "normal") {
+            lineNumber = c.ln2;
+        }
+        else if (c.type === "add") {
+            lineNumber = c.ln;
+        }
+        else if (c.type === "del") {
+            lineNumber = c.ln;
+        }
+        return `${lineNumber} ${c.content}`;
+    })
+        .join("\n")} 
 \`\`\`
 `;
 }
@@ -177,13 +190,17 @@ function createComment(file, chunk, aiResponses) {
 }
 function createReviewComment(owner, repo, pull_number, comments) {
     return __awaiter(this, void 0, void 0, function* () {
-        yield octokit.pulls.createReview({
-            owner,
-            repo,
-            pull_number,
-            comments,
-            event: "COMMENT",
-        });
+        // Create review comments one by one
+        // for (const comment of comments) {
+        //   await gitea.repos.commentcreatePullReviewComment({
+        //     owner,
+        //     repo,
+        //     index: pull_number,
+        //     body: comment.body,
+        //     path: comment.path,
+        //     line: comment.line,
+        //   });
+        // }
     });
 }
 function main() {
@@ -191,26 +208,25 @@ function main() {
     return __awaiter(this, void 0, void 0, function* () {
         const prDetails = yield getPRDetails();
         let diff;
-        const eventData = JSON.parse((0, fs_1.readFileSync)((_a = process.env.GITHUB_EVENT_PATH) !== null && _a !== void 0 ? _a : "", "utf8"));
+        const eventData = JSON.parse((0, fs_1.readFileSync)((_a = process.env.GITEA_EVENT_PATH) !== null && _a !== void 0 ? _a : "", "utf8"));
+        console.log("Event data:", eventData);
         if (eventData.action === "opened") {
             diff = yield getDiff(prDetails.owner, prDetails.repo, prDetails.pull_number);
         }
-        else if (eventData.action === "synchronize") {
+        else if (eventData.action === "synchronized") {
+            const git = simpleGit();
             const newBaseSha = eventData.before;
             const newHeadSha = eventData.after;
-            const response = yield octokit.repos.compareCommits({
-                headers: {
-                    accept: "application/vnd.github.v3.diff",
-                },
-                owner: prDetails.owner,
-                repo: prDetails.repo,
-                base: newBaseSha,
-                head: newHeadSha,
-            });
-            diff = String(response.data);
+            try {
+                diff = yield git.diff([`${newBaseSha}...${newHeadSha}`]);
+            }
+            catch (error) {
+                console.error("Error getting diff with simple-git:", error);
+                diff = null;
+            }
         }
         else {
-            console.log("Unsupported event:", process.env.GITHUB_EVENT_NAME);
+            console.log("Unsupported event:", process.env.GITEA_EVENT_NAME);
             return;
         }
         if (!diff) {
@@ -218,14 +234,17 @@ function main() {
             return;
         }
         const parsedDiff = (0, parse_diff_1.default)(diff);
-        const excludePatterns = core
-            .getInput("exclude")
-            .split(",")
-            .map((s) => s.trim());
-        const filteredDiff = parsedDiff.filter((file) => {
-            return !excludePatterns.some((pattern) => { var _a; return (0, minimatch_1.default)((_a = file.to) !== null && _a !== void 0 ? _a : "", pattern); });
-        });
-        const comments = yield analyzeCode(filteredDiff, prDetails);
+        console.log("Parsed diff:", parsedDiff);
+        // const excludePatterns = core
+        //   .getInput("exclude")
+        //   .split(",")
+        //   .map((s) => s.trim());
+        // const filteredDiff = parsedDiff.filter((file) => {
+        //   return !excludePatterns.some((pattern) =>
+        //     minimatch(file.to ?? "", pattern)
+        //   );
+        // });
+        const comments = yield analyzeCode(parsedDiff, prDetails);
         if (comments.length > 0) {
             yield createReviewComment(prDetails.owner, prDetails.repo, prDetails.pull_number, comments);
         }
@@ -2015,2237 +2034,145 @@ function isLoopbackAddress(host) {
 
 /***/ }),
 
-/***/ 334:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-
-const REGEX_IS_INSTALLATION_LEGACY = /^v1\./;
-const REGEX_IS_INSTALLATION = /^ghs_/;
-const REGEX_IS_USER_TO_SERVER = /^ghu_/;
-async function auth(token) {
-  const isApp = token.split(/\./).length === 3;
-  const isInstallation = REGEX_IS_INSTALLATION_LEGACY.test(token) || REGEX_IS_INSTALLATION.test(token);
-  const isUserToServer = REGEX_IS_USER_TO_SERVER.test(token);
-  const tokenType = isApp ? "app" : isInstallation ? "installation" : isUserToServer ? "user-to-server" : "oauth";
-  return {
-    type: "token",
-    token: token,
-    tokenType
-  };
-}
-
-/**
- * Prefix token for usage in the Authorization header
- *
- * @param token OAuth token or JSON Web Token
- */
-function withAuthorizationPrefix(token) {
-  if (token.split(/\./).length === 3) {
-    return `bearer ${token}`;
-  }
-  return `token ${token}`;
-}
-
-async function hook(token, request, route, parameters) {
-  const endpoint = request.endpoint.merge(route, parameters);
-  endpoint.headers.authorization = withAuthorizationPrefix(token);
-  return request(endpoint);
-}
-
-const createTokenAuth = function createTokenAuth(token) {
-  if (!token) {
-    throw new Error("[@octokit/auth-token] No token passed to createTokenAuth");
-  }
-  if (typeof token !== "string") {
-    throw new Error("[@octokit/auth-token] Token passed to createTokenAuth is not a string");
-  }
-  token = token.replace(/^(token|bearer) +/i, "");
-  return Object.assign(auth.bind(null, token), {
-    hook: hook.bind(null, token)
-  });
-};
-
-exports.createTokenAuth = createTokenAuth;
-//# sourceMappingURL=index.js.map
-
-
-/***/ }),
-
-/***/ 6762:
+/***/ 4751:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 "use strict";
 
+function __export(m) {
+    for (var p in m) if (!exports.hasOwnProperty(p)) exports[p] = m[p];
+}
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+__export(__nccwpck_require__(2825));
+//# sourceMappingURL=index.js.map
+
+/***/ }),
+
+/***/ 2825:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+const fs_1 = __nccwpck_require__(7147);
+const debug_1 = __importDefault(__nccwpck_require__(8237));
+const log = debug_1.default('@kwsites/file-exists');
+function check(path, isFile, isDirectory) {
+    log(`checking %s`, path);
+    try {
+        const stat = fs_1.statSync(path);
+        if (stat.isFile() && isFile) {
+            log(`[OK] path represents a file`);
+            return true;
+        }
+        if (stat.isDirectory() && isDirectory) {
+            log(`[OK] path represents a directory`);
+            return true;
+        }
+        log(`[FAIL] path represents something other than a file or directory`);
+        return false;
+    }
+    catch (e) {
+        if (e.code === 'ENOENT') {
+            log(`[FAIL] path is not accessible: %o`, e);
+            return false;
+        }
+        log(`[FATAL] %o`, e);
+        throw e;
+    }
+}
+/**
+ * Synchronous validation of a path existing either as a file or as a directory.
+ *
+ * @param {string} path The path to check
+ * @param {number} type One or both of the exported numeric constants
+ */
+function exists(path, type = exports.READABLE) {
+    return check(path, (type & exports.FILE) > 0, (type & exports.FOLDER) > 0);
+}
+exports.exists = exists;
+/**
+ * Constant representing a file
+ */
+exports.FILE = 1;
+/**
+ * Constant representing a folder
+ */
+exports.FOLDER = 2;
+/**
+ * Constant representing either a file or a folder
+ */
+exports.READABLE = exports.FILE + exports.FOLDER;
+//# sourceMappingURL=index.js.map
+
+/***/ }),
+
+/***/ 9819:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-
-var universalUserAgent = __nccwpck_require__(5030);
-var beforeAfterHook = __nccwpck_require__(3682);
-var request = __nccwpck_require__(6234);
-var graphql = __nccwpck_require__(8467);
-var authToken = __nccwpck_require__(334);
-
-const VERSION = "4.2.0";
-
-class Octokit {
-  constructor(options = {}) {
-    const hook = new beforeAfterHook.Collection();
-    const requestDefaults = {
-      baseUrl: request.request.endpoint.DEFAULTS.baseUrl,
-      headers: {},
-      request: Object.assign({}, options.request, {
-        // @ts-ignore internal usage only, no need to type
-        hook: hook.bind(null, "request")
-      }),
-      mediaType: {
-        previews: [],
-        format: ""
-      }
-    }; // prepend default user agent with `options.userAgent` if set
-
-    requestDefaults.headers["user-agent"] = [options.userAgent, `octokit-core.js/${VERSION} ${universalUserAgent.getUserAgent()}`].filter(Boolean).join(" ");
-
-    if (options.baseUrl) {
-      requestDefaults.baseUrl = options.baseUrl;
-    }
-
-    if (options.previews) {
-      requestDefaults.mediaType.previews = options.previews;
-    }
-
-    if (options.timeZone) {
-      requestDefaults.headers["time-zone"] = options.timeZone;
-    }
-
-    this.request = request.request.defaults(requestDefaults);
-    this.graphql = graphql.withCustomRequest(this.request).defaults(requestDefaults);
-    this.log = Object.assign({
-      debug: () => {},
-      info: () => {},
-      warn: console.warn.bind(console),
-      error: console.error.bind(console)
-    }, options.log);
-    this.hook = hook; // (1) If neither `options.authStrategy` nor `options.auth` are set, the `octokit` instance
-    //     is unauthenticated. The `this.auth()` method is a no-op and no request hook is registered.
-    // (2) If only `options.auth` is set, use the default token authentication strategy.
-    // (3) If `options.authStrategy` is set then use it and pass in `options.auth`. Always pass own request as many strategies accept a custom request instance.
-    // TODO: type `options.auth` based on `options.authStrategy`.
-
-    if (!options.authStrategy) {
-      if (!options.auth) {
-        // (1)
-        this.auth = async () => ({
-          type: "unauthenticated"
-        });
-      } else {
-        // (2)
-        const auth = authToken.createTokenAuth(options.auth); // @ts-ignore  ¯\_(ツ)_/¯
-
-        hook.wrap("request", auth.hook);
-        this.auth = auth;
-      }
-    } else {
-      const {
-        authStrategy,
-        ...otherOptions
-      } = options;
-      const auth = authStrategy(Object.assign({
-        request: this.request,
-        log: this.log,
-        // we pass the current octokit instance as well as its constructor options
-        // to allow for authentication strategies that return a new octokit instance
-        // that shares the same internal state as the current one. The original
-        // requirement for this was the "event-octokit" authentication strategy
-        // of https://github.com/probot/octokit-auth-probot.
-        octokit: this,
-        octokitOptions: otherOptions
-      }, options.auth)); // @ts-ignore  ¯\_(ツ)_/¯
-
-      hook.wrap("request", auth.hook);
-      this.auth = auth;
-    } // apply plugins
-    // https://stackoverflow.com/a/16345172
-
-
-    const classConstructor = this.constructor;
-    classConstructor.plugins.forEach(plugin => {
-      Object.assign(this, plugin(this, options));
+exports.createDeferred = exports.deferred = void 0;
+/**
+ * Creates a new `DeferredPromise`
+ *
+ * ```typescript
+ import {deferred} from '@kwsites/promise-deferred`;
+ ```
+ */
+function deferred() {
+    let done;
+    let fail;
+    let status = 'pending';
+    const promise = new Promise((_done, _fail) => {
+        done = _done;
+        fail = _fail;
     });
-  }
-
-  static defaults(defaults) {
-    const OctokitWithDefaults = class extends this {
-      constructor(...args) {
-        const options = args[0] || {};
-
-        if (typeof defaults === "function") {
-          super(defaults(options));
-          return;
-        }
-
-        super(Object.assign({}, defaults, options, options.userAgent && defaults.userAgent ? {
-          userAgent: `${options.userAgent} ${defaults.userAgent}`
-        } : null));
-      }
-
-    };
-    return OctokitWithDefaults;
-  }
-  /**
-   * Attach a plugin (or many) to your Octokit instance.
-   *
-   * @example
-   * const API = Octokit.plugin(plugin1, plugin2, plugin3, ...)
-   */
-
-
-  static plugin(...newPlugins) {
-    var _a;
-
-    const currentPlugins = this.plugins;
-    const NewOctokit = (_a = class extends this {}, _a.plugins = currentPlugins.concat(newPlugins.filter(plugin => !currentPlugins.includes(plugin))), _a);
-    return NewOctokit;
-  }
-
-}
-Octokit.VERSION = VERSION;
-Octokit.plugins = [];
-
-exports.Octokit = Octokit;
-//# sourceMappingURL=index.js.map
-
-
-/***/ }),
-
-/***/ 9440:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-
-var isPlainObject = __nccwpck_require__(3287);
-var universalUserAgent = __nccwpck_require__(5030);
-
-function lowercaseKeys(object) {
-  if (!object) {
-    return {};
-  }
-  return Object.keys(object).reduce((newObj, key) => {
-    newObj[key.toLowerCase()] = object[key];
-    return newObj;
-  }, {});
-}
-
-function mergeDeep(defaults, options) {
-  const result = Object.assign({}, defaults);
-  Object.keys(options).forEach(key => {
-    if (isPlainObject.isPlainObject(options[key])) {
-      if (!(key in defaults)) Object.assign(result, {
-        [key]: options[key]
-      });else result[key] = mergeDeep(defaults[key], options[key]);
-    } else {
-      Object.assign(result, {
-        [key]: options[key]
-      });
-    }
-  });
-  return result;
-}
-
-function removeUndefinedProperties(obj) {
-  for (const key in obj) {
-    if (obj[key] === undefined) {
-      delete obj[key];
-    }
-  }
-  return obj;
-}
-
-function merge(defaults, route, options) {
-  if (typeof route === "string") {
-    let [method, url] = route.split(" ");
-    options = Object.assign(url ? {
-      method,
-      url
-    } : {
-      url: method
-    }, options);
-  } else {
-    options = Object.assign({}, route);
-  }
-  // lowercase header names before merging with defaults to avoid duplicates
-  options.headers = lowercaseKeys(options.headers);
-  // remove properties with undefined values before merging
-  removeUndefinedProperties(options);
-  removeUndefinedProperties(options.headers);
-  const mergedOptions = mergeDeep(defaults || {}, options);
-  // mediaType.previews arrays are merged, instead of overwritten
-  if (defaults && defaults.mediaType.previews.length) {
-    mergedOptions.mediaType.previews = defaults.mediaType.previews.filter(preview => !mergedOptions.mediaType.previews.includes(preview)).concat(mergedOptions.mediaType.previews);
-  }
-  mergedOptions.mediaType.previews = mergedOptions.mediaType.previews.map(preview => preview.replace(/-preview/, ""));
-  return mergedOptions;
-}
-
-function addQueryParameters(url, parameters) {
-  const separator = /\?/.test(url) ? "&" : "?";
-  const names = Object.keys(parameters);
-  if (names.length === 0) {
-    return url;
-  }
-  return url + separator + names.map(name => {
-    if (name === "q") {
-      return "q=" + parameters.q.split("+").map(encodeURIComponent).join("+");
-    }
-    return `${name}=${encodeURIComponent(parameters[name])}`;
-  }).join("&");
-}
-
-const urlVariableRegex = /\{[^}]+\}/g;
-function removeNonChars(variableName) {
-  return variableName.replace(/^\W+|\W+$/g, "").split(/,/);
-}
-function extractUrlVariableNames(url) {
-  const matches = url.match(urlVariableRegex);
-  if (!matches) {
-    return [];
-  }
-  return matches.map(removeNonChars).reduce((a, b) => a.concat(b), []);
-}
-
-function omit(object, keysToOmit) {
-  return Object.keys(object).filter(option => !keysToOmit.includes(option)).reduce((obj, key) => {
-    obj[key] = object[key];
-    return obj;
-  }, {});
-}
-
-// Based on https://github.com/bramstein/url-template, licensed under BSD
-// TODO: create separate package.
-//
-// Copyright (c) 2012-2014, Bram Stein
-// All rights reserved.
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  1. Redistributions of source code must retain the above copyright
-//     notice, this list of conditions and the following disclaimer.
-//  2. Redistributions in binary form must reproduce the above copyright
-//     notice, this list of conditions and the following disclaimer in the
-//     documentation and/or other materials provided with the distribution.
-//  3. The name of the author may not be used to endorse or promote products
-//     derived from this software without specific prior written permission.
-// THIS SOFTWARE IS PROVIDED BY THE AUTHOR "AS IS" AND ANY EXPRESS OR IMPLIED
-// WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
-// MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO
-// EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT,
-// INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
-// BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
-// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
-// NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,
-// EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-/* istanbul ignore file */
-function encodeReserved(str) {
-  return str.split(/(%[0-9A-Fa-f]{2})/g).map(function (part) {
-    if (!/%[0-9A-Fa-f]/.test(part)) {
-      part = encodeURI(part).replace(/%5B/g, "[").replace(/%5D/g, "]");
-    }
-    return part;
-  }).join("");
-}
-function encodeUnreserved(str) {
-  return encodeURIComponent(str).replace(/[!'()*]/g, function (c) {
-    return "%" + c.charCodeAt(0).toString(16).toUpperCase();
-  });
-}
-function encodeValue(operator, value, key) {
-  value = operator === "+" || operator === "#" ? encodeReserved(value) : encodeUnreserved(value);
-  if (key) {
-    return encodeUnreserved(key) + "=" + value;
-  } else {
-    return value;
-  }
-}
-function isDefined(value) {
-  return value !== undefined && value !== null;
-}
-function isKeyOperator(operator) {
-  return operator === ";" || operator === "&" || operator === "?";
-}
-function getValues(context, operator, key, modifier) {
-  var value = context[key],
-    result = [];
-  if (isDefined(value) && value !== "") {
-    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-      value = value.toString();
-      if (modifier && modifier !== "*") {
-        value = value.substring(0, parseInt(modifier, 10));
-      }
-      result.push(encodeValue(operator, value, isKeyOperator(operator) ? key : ""));
-    } else {
-      if (modifier === "*") {
-        if (Array.isArray(value)) {
-          value.filter(isDefined).forEach(function (value) {
-            result.push(encodeValue(operator, value, isKeyOperator(operator) ? key : ""));
-          });
-        } else {
-          Object.keys(value).forEach(function (k) {
-            if (isDefined(value[k])) {
-              result.push(encodeValue(operator, value[k], k));
-            }
-          });
-        }
-      } else {
-        const tmp = [];
-        if (Array.isArray(value)) {
-          value.filter(isDefined).forEach(function (value) {
-            tmp.push(encodeValue(operator, value));
-          });
-        } else {
-          Object.keys(value).forEach(function (k) {
-            if (isDefined(value[k])) {
-              tmp.push(encodeUnreserved(k));
-              tmp.push(encodeValue(operator, value[k].toString()));
-            }
-          });
-        }
-        if (isKeyOperator(operator)) {
-          result.push(encodeUnreserved(key) + "=" + tmp.join(","));
-        } else if (tmp.length !== 0) {
-          result.push(tmp.join(","));
-        }
-      }
-    }
-  } else {
-    if (operator === ";") {
-      if (isDefined(value)) {
-        result.push(encodeUnreserved(key));
-      }
-    } else if (value === "" && (operator === "&" || operator === "?")) {
-      result.push(encodeUnreserved(key) + "=");
-    } else if (value === "") {
-      result.push("");
-    }
-  }
-  return result;
-}
-function parseUrl(template) {
-  return {
-    expand: expand.bind(null, template)
-  };
-}
-function expand(template, context) {
-  var operators = ["+", "#", ".", "/", ";", "?", "&"];
-  return template.replace(/\{([^\{\}]+)\}|([^\{\}]+)/g, function (_, expression, literal) {
-    if (expression) {
-      let operator = "";
-      const values = [];
-      if (operators.indexOf(expression.charAt(0)) !== -1) {
-        operator = expression.charAt(0);
-        expression = expression.substr(1);
-      }
-      expression.split(/,/g).forEach(function (variable) {
-        var tmp = /([^:\*]*)(?::(\d+)|(\*))?/.exec(variable);
-        values.push(getValues(context, operator, tmp[1], tmp[2] || tmp[3]));
-      });
-      if (operator && operator !== "+") {
-        var separator = ",";
-        if (operator === "?") {
-          separator = "&";
-        } else if (operator !== "#") {
-          separator = operator;
-        }
-        return (values.length !== 0 ? operator : "") + values.join(separator);
-      } else {
-        return values.join(",");
-      }
-    } else {
-      return encodeReserved(literal);
-    }
-  });
-}
-
-function parse(options) {
-  // https://fetch.spec.whatwg.org/#methods
-  let method = options.method.toUpperCase();
-  // replace :varname with {varname} to make it RFC 6570 compatible
-  let url = (options.url || "/").replace(/:([a-z]\w+)/g, "{$1}");
-  let headers = Object.assign({}, options.headers);
-  let body;
-  let parameters = omit(options, ["method", "baseUrl", "url", "headers", "request", "mediaType"]);
-  // extract variable names from URL to calculate remaining variables later
-  const urlVariableNames = extractUrlVariableNames(url);
-  url = parseUrl(url).expand(parameters);
-  if (!/^http/.test(url)) {
-    url = options.baseUrl + url;
-  }
-  const omittedParameters = Object.keys(options).filter(option => urlVariableNames.includes(option)).concat("baseUrl");
-  const remainingParameters = omit(parameters, omittedParameters);
-  const isBinaryRequest = /application\/octet-stream/i.test(headers.accept);
-  if (!isBinaryRequest) {
-    if (options.mediaType.format) {
-      // e.g. application/vnd.github.v3+json => application/vnd.github.v3.raw
-      headers.accept = headers.accept.split(/,/).map(preview => preview.replace(/application\/vnd(\.\w+)(\.v3)?(\.\w+)?(\+json)?$/, `application/vnd$1$2.${options.mediaType.format}`)).join(",");
-    }
-    if (options.mediaType.previews.length) {
-      const previewsFromAcceptHeader = headers.accept.match(/[\w-]+(?=-preview)/g) || [];
-      headers.accept = previewsFromAcceptHeader.concat(options.mediaType.previews).map(preview => {
-        const format = options.mediaType.format ? `.${options.mediaType.format}` : "+json";
-        return `application/vnd.github.${preview}-preview${format}`;
-      }).join(",");
-    }
-  }
-  // for GET/HEAD requests, set URL query parameters from remaining parameters
-  // for PATCH/POST/PUT/DELETE requests, set request body from remaining parameters
-  if (["GET", "HEAD"].includes(method)) {
-    url = addQueryParameters(url, remainingParameters);
-  } else {
-    if ("data" in remainingParameters) {
-      body = remainingParameters.data;
-    } else {
-      if (Object.keys(remainingParameters).length) {
-        body = remainingParameters;
-      }
-    }
-  }
-  // default content-type for JSON if body is set
-  if (!headers["content-type"] && typeof body !== "undefined") {
-    headers["content-type"] = "application/json; charset=utf-8";
-  }
-  // GitHub expects 'content-length: 0' header for PUT/PATCH requests without body.
-  // fetch does not allow to set `content-length` header, but we can set body to an empty string
-  if (["PATCH", "PUT"].includes(method) && typeof body === "undefined") {
-    body = "";
-  }
-  // Only return body/request keys if present
-  return Object.assign({
-    method,
-    url,
-    headers
-  }, typeof body !== "undefined" ? {
-    body
-  } : null, options.request ? {
-    request: options.request
-  } : null);
-}
-
-function endpointWithDefaults(defaults, route, options) {
-  return parse(merge(defaults, route, options));
-}
-
-function withDefaults(oldDefaults, newDefaults) {
-  const DEFAULTS = merge(oldDefaults, newDefaults);
-  const endpoint = endpointWithDefaults.bind(null, DEFAULTS);
-  return Object.assign(endpoint, {
-    DEFAULTS,
-    defaults: withDefaults.bind(null, DEFAULTS),
-    merge: merge.bind(null, DEFAULTS),
-    parse
-  });
-}
-
-const VERSION = "7.0.5";
-
-const userAgent = `octokit-endpoint.js/${VERSION} ${universalUserAgent.getUserAgent()}`;
-// DEFAULTS has all properties set that EndpointOptions has, except url.
-// So we use RequestParameters and add method as additional required property.
-const DEFAULTS = {
-  method: "GET",
-  baseUrl: "https://api.github.com",
-  headers: {
-    accept: "application/vnd.github.v3+json",
-    "user-agent": userAgent
-  },
-  mediaType: {
-    format: "",
-    previews: []
-  }
-};
-
-const endpoint = withDefaults(null, DEFAULTS);
-
-exports.endpoint = endpoint;
-//# sourceMappingURL=index.js.map
-
-
-/***/ }),
-
-/***/ 8467:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-
-var request = __nccwpck_require__(6234);
-var universalUserAgent = __nccwpck_require__(5030);
-
-const VERSION = "5.0.5";
-
-function _buildMessageForResponseErrors(data) {
-  return `Request failed due to following response errors:\n` + data.errors.map(e => ` - ${e.message}`).join("\n");
-}
-class GraphqlResponseError extends Error {
-  constructor(request, headers, response) {
-    super(_buildMessageForResponseErrors(response));
-    this.request = request;
-    this.headers = headers;
-    this.response = response;
-    this.name = "GraphqlResponseError";
-    // Expose the errors and response data in their shorthand properties.
-    this.errors = response.errors;
-    this.data = response.data;
-    // Maintains proper stack trace (only available on V8)
-    /* istanbul ignore next */
-    if (Error.captureStackTrace) {
-      Error.captureStackTrace(this, this.constructor);
-    }
-  }
-}
-
-const NON_VARIABLE_OPTIONS = ["method", "baseUrl", "url", "headers", "request", "query", "mediaType"];
-const FORBIDDEN_VARIABLE_OPTIONS = ["query", "method", "url"];
-const GHES_V3_SUFFIX_REGEX = /\/api\/v3\/?$/;
-function graphql(request, query, options) {
-  if (options) {
-    if (typeof query === "string" && "query" in options) {
-      return Promise.reject(new Error(`[@octokit/graphql] "query" cannot be used as variable name`));
-    }
-    for (const key in options) {
-      if (!FORBIDDEN_VARIABLE_OPTIONS.includes(key)) continue;
-      return Promise.reject(new Error(`[@octokit/graphql] "${key}" cannot be used as variable name`));
-    }
-  }
-  const parsedOptions = typeof query === "string" ? Object.assign({
-    query
-  }, options) : query;
-  const requestOptions = Object.keys(parsedOptions).reduce((result, key) => {
-    if (NON_VARIABLE_OPTIONS.includes(key)) {
-      result[key] = parsedOptions[key];
-      return result;
-    }
-    if (!result.variables) {
-      result.variables = {};
-    }
-    result.variables[key] = parsedOptions[key];
-    return result;
-  }, {});
-  // workaround for GitHub Enterprise baseUrl set with /api/v3 suffix
-  // https://github.com/octokit/auth-app.js/issues/111#issuecomment-657610451
-  const baseUrl = parsedOptions.baseUrl || request.endpoint.DEFAULTS.baseUrl;
-  if (GHES_V3_SUFFIX_REGEX.test(baseUrl)) {
-    requestOptions.url = baseUrl.replace(GHES_V3_SUFFIX_REGEX, "/api/graphql");
-  }
-  return request(requestOptions).then(response => {
-    if (response.data.errors) {
-      const headers = {};
-      for (const key of Object.keys(response.headers)) {
-        headers[key] = response.headers[key];
-      }
-      throw new GraphqlResponseError(requestOptions, headers, response.data);
-    }
-    return response.data.data;
-  });
-}
-
-function withDefaults(request, newDefaults) {
-  const newRequest = request.defaults(newDefaults);
-  const newApi = (query, options) => {
-    return graphql(newRequest, query, options);
-  };
-  return Object.assign(newApi, {
-    defaults: withDefaults.bind(null, newRequest),
-    endpoint: newRequest.endpoint
-  });
-}
-
-const graphql$1 = withDefaults(request.request, {
-  headers: {
-    "user-agent": `octokit-graphql.js/${VERSION} ${universalUserAgent.getUserAgent()}`
-  },
-  method: "POST",
-  url: "/graphql"
-});
-function withCustomRequest(customRequest) {
-  return withDefaults(customRequest, {
-    method: "POST",
-    url: "/graphql"
-  });
-}
-
-exports.GraphqlResponseError = GraphqlResponseError;
-exports.graphql = graphql$1;
-exports.withCustomRequest = withCustomRequest;
-//# sourceMappingURL=index.js.map
-
-
-/***/ }),
-
-/***/ 4193:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-
-const VERSION = "6.0.0";
-
-/**
- * Some “list” response that can be paginated have a different response structure
- *
- * They have a `total_count` key in the response (search also has `incomplete_results`,
- * /installation/repositories also has `repository_selection`), as well as a key with
- * the list of the items which name varies from endpoint to endpoint.
- *
- * Octokit normalizes these responses so that paginated results are always returned following
- * the same structure. One challenge is that if the list response has only one page, no Link
- * header is provided, so this header alone is not sufficient to check wether a response is
- * paginated or not.
- *
- * We check if a "total_count" key is present in the response data, but also make sure that
- * a "url" property is not, as the "Get the combined status for a specific ref" endpoint would
- * otherwise match: https://developer.github.com/v3/repos/statuses/#get-the-combined-status-for-a-specific-ref
- */
-function normalizePaginatedListResponse(response) {
-  // endpoints can respond with 204 if repository is empty
-  if (!response.data) {
     return {
-      ...response,
-      data: []
-    };
-  }
-  const responseNeedsNormalization = "total_count" in response.data && !("url" in response.data);
-  if (!responseNeedsNormalization) return response;
-  // keep the additional properties intact as there is currently no other way
-  // to retrieve the same information.
-  const incompleteResults = response.data.incomplete_results;
-  const repositorySelection = response.data.repository_selection;
-  const totalCount = response.data.total_count;
-  delete response.data.incomplete_results;
-  delete response.data.repository_selection;
-  delete response.data.total_count;
-  const namespaceKey = Object.keys(response.data)[0];
-  const data = response.data[namespaceKey];
-  response.data = data;
-  if (typeof incompleteResults !== "undefined") {
-    response.data.incomplete_results = incompleteResults;
-  }
-  if (typeof repositorySelection !== "undefined") {
-    response.data.repository_selection = repositorySelection;
-  }
-  response.data.total_count = totalCount;
-  return response;
-}
-
-function iterator(octokit, route, parameters) {
-  const options = typeof route === "function" ? route.endpoint(parameters) : octokit.request.endpoint(route, parameters);
-  const requestMethod = typeof route === "function" ? route : octokit.request;
-  const method = options.method;
-  const headers = options.headers;
-  let url = options.url;
-  return {
-    [Symbol.asyncIterator]: () => ({
-      async next() {
-        if (!url) return {
-          done: true
-        };
-        try {
-          const response = await requestMethod({
-            method,
-            url,
-            headers
-          });
-          const normalizedResponse = normalizePaginatedListResponse(response);
-          // `response.headers.link` format:
-          // '<https://api.github.com/users/aseemk/followers?page=2>; rel="next", <https://api.github.com/users/aseemk/followers?page=2>; rel="last"'
-          // sets `url` to undefined if "next" URL is not present or `link` header is not set
-          url = ((normalizedResponse.headers.link || "").match(/<([^>]+)>;\s*rel="next"/) || [])[1];
-          return {
-            value: normalizedResponse
-          };
-        } catch (error) {
-          if (error.status !== 409) throw error;
-          url = "";
-          return {
-            value: {
-              status: 200,
-              headers: {},
-              data: []
+        promise,
+        done(result) {
+            if (status === 'pending') {
+                status = 'resolved';
+                done(result);
             }
-          };
-        }
-      }
-    })
-  };
-}
-
-function paginate(octokit, route, parameters, mapFn) {
-  if (typeof parameters === "function") {
-    mapFn = parameters;
-    parameters = undefined;
-  }
-  return gather(octokit, [], iterator(octokit, route, parameters)[Symbol.asyncIterator](), mapFn);
-}
-function gather(octokit, results, iterator, mapFn) {
-  return iterator.next().then(result => {
-    if (result.done) {
-      return results;
-    }
-    let earlyExit = false;
-    function done() {
-      earlyExit = true;
-    }
-    results = results.concat(mapFn ? mapFn(result.value, done) : result.value.data);
-    if (earlyExit) {
-      return results;
-    }
-    return gather(octokit, results, iterator, mapFn);
-  });
-}
-
-const composePaginateRest = Object.assign(paginate, {
-  iterator
-});
-
-const paginatingEndpoints = ["GET /app/hook/deliveries", "GET /app/installations", "GET /enterprises/{enterprise}/actions/runner-groups", "GET /enterprises/{enterprise}/dependabot/alerts", "GET /enterprises/{enterprise}/secret-scanning/alerts", "GET /events", "GET /gists", "GET /gists/public", "GET /gists/starred", "GET /gists/{gist_id}/comments", "GET /gists/{gist_id}/commits", "GET /gists/{gist_id}/forks", "GET /installation/repositories", "GET /issues", "GET /licenses", "GET /marketplace_listing/plans", "GET /marketplace_listing/plans/{plan_id}/accounts", "GET /marketplace_listing/stubbed/plans", "GET /marketplace_listing/stubbed/plans/{plan_id}/accounts", "GET /networks/{owner}/{repo}/events", "GET /notifications", "GET /organizations", "GET /orgs/{org}/actions/cache/usage-by-repository", "GET /orgs/{org}/actions/permissions/repositories", "GET /orgs/{org}/actions/required_workflows", "GET /orgs/{org}/actions/runner-groups", "GET /orgs/{org}/actions/runner-groups/{runner_group_id}/repositories", "GET /orgs/{org}/actions/runner-groups/{runner_group_id}/runners", "GET /orgs/{org}/actions/runners", "GET /orgs/{org}/actions/secrets", "GET /orgs/{org}/actions/secrets/{secret_name}/repositories", "GET /orgs/{org}/actions/variables", "GET /orgs/{org}/actions/variables/{name}/repositories", "GET /orgs/{org}/blocks", "GET /orgs/{org}/code-scanning/alerts", "GET /orgs/{org}/codespaces", "GET /orgs/{org}/codespaces/secrets", "GET /orgs/{org}/codespaces/secrets/{secret_name}/repositories", "GET /orgs/{org}/dependabot/alerts", "GET /orgs/{org}/dependabot/secrets", "GET /orgs/{org}/dependabot/secrets/{secret_name}/repositories", "GET /orgs/{org}/events", "GET /orgs/{org}/failed_invitations", "GET /orgs/{org}/hooks", "GET /orgs/{org}/hooks/{hook_id}/deliveries", "GET /orgs/{org}/installations", "GET /orgs/{org}/invitations", "GET /orgs/{org}/invitations/{invitation_id}/teams", "GET /orgs/{org}/issues", "GET /orgs/{org}/members", "GET /orgs/{org}/members/{username}/codespaces", "GET /orgs/{org}/migrations", "GET /orgs/{org}/migrations/{migration_id}/repositories", "GET /orgs/{org}/outside_collaborators", "GET /orgs/{org}/packages", "GET /orgs/{org}/packages/{package_type}/{package_name}/versions", "GET /orgs/{org}/projects", "GET /orgs/{org}/public_members", "GET /orgs/{org}/repos", "GET /orgs/{org}/secret-scanning/alerts", "GET /orgs/{org}/teams", "GET /orgs/{org}/teams/{team_slug}/discussions", "GET /orgs/{org}/teams/{team_slug}/discussions/{discussion_number}/comments", "GET /orgs/{org}/teams/{team_slug}/discussions/{discussion_number}/comments/{comment_number}/reactions", "GET /orgs/{org}/teams/{team_slug}/discussions/{discussion_number}/reactions", "GET /orgs/{org}/teams/{team_slug}/invitations", "GET /orgs/{org}/teams/{team_slug}/members", "GET /orgs/{org}/teams/{team_slug}/projects", "GET /orgs/{org}/teams/{team_slug}/repos", "GET /orgs/{org}/teams/{team_slug}/teams", "GET /projects/columns/{column_id}/cards", "GET /projects/{project_id}/collaborators", "GET /projects/{project_id}/columns", "GET /repos/{org}/{repo}/actions/required_workflows", "GET /repos/{owner}/{repo}/actions/artifacts", "GET /repos/{owner}/{repo}/actions/caches", "GET /repos/{owner}/{repo}/actions/required_workflows/{required_workflow_id_for_repo}/runs", "GET /repos/{owner}/{repo}/actions/runners", "GET /repos/{owner}/{repo}/actions/runs", "GET /repos/{owner}/{repo}/actions/runs/{run_id}/artifacts", "GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt_number}/jobs", "GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs", "GET /repos/{owner}/{repo}/actions/secrets", "GET /repos/{owner}/{repo}/actions/variables", "GET /repos/{owner}/{repo}/actions/workflows", "GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs", "GET /repos/{owner}/{repo}/assignees", "GET /repos/{owner}/{repo}/branches", "GET /repos/{owner}/{repo}/check-runs/{check_run_id}/annotations", "GET /repos/{owner}/{repo}/check-suites/{check_suite_id}/check-runs", "GET /repos/{owner}/{repo}/code-scanning/alerts", "GET /repos/{owner}/{repo}/code-scanning/alerts/{alert_number}/instances", "GET /repos/{owner}/{repo}/code-scanning/analyses", "GET /repos/{owner}/{repo}/codespaces", "GET /repos/{owner}/{repo}/codespaces/devcontainers", "GET /repos/{owner}/{repo}/codespaces/secrets", "GET /repos/{owner}/{repo}/collaborators", "GET /repos/{owner}/{repo}/comments", "GET /repos/{owner}/{repo}/comments/{comment_id}/reactions", "GET /repos/{owner}/{repo}/commits", "GET /repos/{owner}/{repo}/commits/{commit_sha}/comments", "GET /repos/{owner}/{repo}/commits/{commit_sha}/pulls", "GET /repos/{owner}/{repo}/commits/{ref}/check-runs", "GET /repos/{owner}/{repo}/commits/{ref}/check-suites", "GET /repos/{owner}/{repo}/commits/{ref}/status", "GET /repos/{owner}/{repo}/commits/{ref}/statuses", "GET /repos/{owner}/{repo}/contributors", "GET /repos/{owner}/{repo}/dependabot/alerts", "GET /repos/{owner}/{repo}/dependabot/secrets", "GET /repos/{owner}/{repo}/deployments", "GET /repos/{owner}/{repo}/deployments/{deployment_id}/statuses", "GET /repos/{owner}/{repo}/environments", "GET /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies", "GET /repos/{owner}/{repo}/events", "GET /repos/{owner}/{repo}/forks", "GET /repos/{owner}/{repo}/hooks", "GET /repos/{owner}/{repo}/hooks/{hook_id}/deliveries", "GET /repos/{owner}/{repo}/invitations", "GET /repos/{owner}/{repo}/issues", "GET /repos/{owner}/{repo}/issues/comments", "GET /repos/{owner}/{repo}/issues/comments/{comment_id}/reactions", "GET /repos/{owner}/{repo}/issues/events", "GET /repos/{owner}/{repo}/issues/{issue_number}/comments", "GET /repos/{owner}/{repo}/issues/{issue_number}/events", "GET /repos/{owner}/{repo}/issues/{issue_number}/labels", "GET /repos/{owner}/{repo}/issues/{issue_number}/reactions", "GET /repos/{owner}/{repo}/issues/{issue_number}/timeline", "GET /repos/{owner}/{repo}/keys", "GET /repos/{owner}/{repo}/labels", "GET /repos/{owner}/{repo}/milestones", "GET /repos/{owner}/{repo}/milestones/{milestone_number}/labels", "GET /repos/{owner}/{repo}/notifications", "GET /repos/{owner}/{repo}/pages/builds", "GET /repos/{owner}/{repo}/projects", "GET /repos/{owner}/{repo}/pulls", "GET /repos/{owner}/{repo}/pulls/comments", "GET /repos/{owner}/{repo}/pulls/comments/{comment_id}/reactions", "GET /repos/{owner}/{repo}/pulls/{pull_number}/comments", "GET /repos/{owner}/{repo}/pulls/{pull_number}/commits", "GET /repos/{owner}/{repo}/pulls/{pull_number}/files", "GET /repos/{owner}/{repo}/pulls/{pull_number}/reviews", "GET /repos/{owner}/{repo}/pulls/{pull_number}/reviews/{review_id}/comments", "GET /repos/{owner}/{repo}/releases", "GET /repos/{owner}/{repo}/releases/{release_id}/assets", "GET /repos/{owner}/{repo}/releases/{release_id}/reactions", "GET /repos/{owner}/{repo}/secret-scanning/alerts", "GET /repos/{owner}/{repo}/secret-scanning/alerts/{alert_number}/locations", "GET /repos/{owner}/{repo}/stargazers", "GET /repos/{owner}/{repo}/subscribers", "GET /repos/{owner}/{repo}/tags", "GET /repos/{owner}/{repo}/teams", "GET /repos/{owner}/{repo}/topics", "GET /repositories", "GET /repositories/{repository_id}/environments/{environment_name}/secrets", "GET /repositories/{repository_id}/environments/{environment_name}/variables", "GET /search/code", "GET /search/commits", "GET /search/issues", "GET /search/labels", "GET /search/repositories", "GET /search/topics", "GET /search/users", "GET /teams/{team_id}/discussions", "GET /teams/{team_id}/discussions/{discussion_number}/comments", "GET /teams/{team_id}/discussions/{discussion_number}/comments/{comment_number}/reactions", "GET /teams/{team_id}/discussions/{discussion_number}/reactions", "GET /teams/{team_id}/invitations", "GET /teams/{team_id}/members", "GET /teams/{team_id}/projects", "GET /teams/{team_id}/repos", "GET /teams/{team_id}/teams", "GET /user/blocks", "GET /user/codespaces", "GET /user/codespaces/secrets", "GET /user/emails", "GET /user/followers", "GET /user/following", "GET /user/gpg_keys", "GET /user/installations", "GET /user/installations/{installation_id}/repositories", "GET /user/issues", "GET /user/keys", "GET /user/marketplace_purchases", "GET /user/marketplace_purchases/stubbed", "GET /user/memberships/orgs", "GET /user/migrations", "GET /user/migrations/{migration_id}/repositories", "GET /user/orgs", "GET /user/packages", "GET /user/packages/{package_type}/{package_name}/versions", "GET /user/public_emails", "GET /user/repos", "GET /user/repository_invitations", "GET /user/ssh_signing_keys", "GET /user/starred", "GET /user/subscriptions", "GET /user/teams", "GET /users", "GET /users/{username}/events", "GET /users/{username}/events/orgs/{org}", "GET /users/{username}/events/public", "GET /users/{username}/followers", "GET /users/{username}/following", "GET /users/{username}/gists", "GET /users/{username}/gpg_keys", "GET /users/{username}/keys", "GET /users/{username}/orgs", "GET /users/{username}/packages", "GET /users/{username}/projects", "GET /users/{username}/received_events", "GET /users/{username}/received_events/public", "GET /users/{username}/repos", "GET /users/{username}/ssh_signing_keys", "GET /users/{username}/starred", "GET /users/{username}/subscriptions"];
-
-function isPaginatingEndpoint(arg) {
-  if (typeof arg === "string") {
-    return paginatingEndpoints.includes(arg);
-  } else {
-    return false;
-  }
-}
-
-/**
- * @param octokit Octokit instance
- * @param options Options passed to Octokit constructor
- */
-function paginateRest(octokit) {
-  return {
-    paginate: Object.assign(paginate.bind(null, octokit), {
-      iterator: iterator.bind(null, octokit)
-    })
-  };
-}
-paginateRest.VERSION = VERSION;
-
-exports.composePaginateRest = composePaginateRest;
-exports.isPaginatingEndpoint = isPaginatingEndpoint;
-exports.paginateRest = paginateRest;
-exports.paginatingEndpoints = paginatingEndpoints;
-//# sourceMappingURL=index.js.map
-
-
-/***/ }),
-
-/***/ 8883:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-
-const VERSION = "1.0.4";
-
-/**
- * @param octokit Octokit instance
- * @param options Options passed to Octokit constructor
- */
-
-function requestLog(octokit) {
-  octokit.hook.wrap("request", (request, options) => {
-    octokit.log.debug("request", options);
-    const start = Date.now();
-    const requestOptions = octokit.request.endpoint.parse(options);
-    const path = requestOptions.url.replace(options.baseUrl, "");
-    return request(options).then(response => {
-      octokit.log.info(`${requestOptions.method} ${path} - ${response.status} in ${Date.now() - start}ms`);
-      return response;
-    }).catch(error => {
-      octokit.log.info(`${requestOptions.method} ${path} - ${error.status} in ${Date.now() - start}ms`);
-      throw error;
-    });
-  });
-}
-requestLog.VERSION = VERSION;
-
-exports.requestLog = requestLog;
-//# sourceMappingURL=index.js.map
-
-
-/***/ }),
-
-/***/ 3044:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-
-const Endpoints = {
-  actions: {
-    addCustomLabelsToSelfHostedRunnerForOrg: ["POST /orgs/{org}/actions/runners/{runner_id}/labels"],
-    addCustomLabelsToSelfHostedRunnerForRepo: ["POST /repos/{owner}/{repo}/actions/runners/{runner_id}/labels"],
-    addSelectedRepoToOrgSecret: ["PUT /orgs/{org}/actions/secrets/{secret_name}/repositories/{repository_id}"],
-    addSelectedRepoToOrgVariable: ["PUT /orgs/{org}/actions/variables/{name}/repositories/{repository_id}"],
-    addSelectedRepoToRequiredWorkflow: ["PUT /orgs/{org}/actions/required_workflows/{required_workflow_id}/repositories/{repository_id}"],
-    approveWorkflowRun: ["POST /repos/{owner}/{repo}/actions/runs/{run_id}/approve"],
-    cancelWorkflowRun: ["POST /repos/{owner}/{repo}/actions/runs/{run_id}/cancel"],
-    createEnvironmentVariable: ["POST /repositories/{repository_id}/environments/{environment_name}/variables"],
-    createOrUpdateEnvironmentSecret: ["PUT /repositories/{repository_id}/environments/{environment_name}/secrets/{secret_name}"],
-    createOrUpdateOrgSecret: ["PUT /orgs/{org}/actions/secrets/{secret_name}"],
-    createOrUpdateRepoSecret: ["PUT /repos/{owner}/{repo}/actions/secrets/{secret_name}"],
-    createOrgVariable: ["POST /orgs/{org}/actions/variables"],
-    createRegistrationTokenForOrg: ["POST /orgs/{org}/actions/runners/registration-token"],
-    createRegistrationTokenForRepo: ["POST /repos/{owner}/{repo}/actions/runners/registration-token"],
-    createRemoveTokenForOrg: ["POST /orgs/{org}/actions/runners/remove-token"],
-    createRemoveTokenForRepo: ["POST /repos/{owner}/{repo}/actions/runners/remove-token"],
-    createRepoVariable: ["POST /repos/{owner}/{repo}/actions/variables"],
-    createRequiredWorkflow: ["POST /orgs/{org}/actions/required_workflows"],
-    createWorkflowDispatch: ["POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches"],
-    deleteActionsCacheById: ["DELETE /repos/{owner}/{repo}/actions/caches/{cache_id}"],
-    deleteActionsCacheByKey: ["DELETE /repos/{owner}/{repo}/actions/caches{?key,ref}"],
-    deleteArtifact: ["DELETE /repos/{owner}/{repo}/actions/artifacts/{artifact_id}"],
-    deleteEnvironmentSecret: ["DELETE /repositories/{repository_id}/environments/{environment_name}/secrets/{secret_name}"],
-    deleteEnvironmentVariable: ["DELETE /repositories/{repository_id}/environments/{environment_name}/variables/{name}"],
-    deleteOrgSecret: ["DELETE /orgs/{org}/actions/secrets/{secret_name}"],
-    deleteOrgVariable: ["DELETE /orgs/{org}/actions/variables/{name}"],
-    deleteRepoSecret: ["DELETE /repos/{owner}/{repo}/actions/secrets/{secret_name}"],
-    deleteRepoVariable: ["DELETE /repos/{owner}/{repo}/actions/variables/{name}"],
-    deleteRequiredWorkflow: ["DELETE /orgs/{org}/actions/required_workflows/{required_workflow_id}"],
-    deleteSelfHostedRunnerFromOrg: ["DELETE /orgs/{org}/actions/runners/{runner_id}"],
-    deleteSelfHostedRunnerFromRepo: ["DELETE /repos/{owner}/{repo}/actions/runners/{runner_id}"],
-    deleteWorkflowRun: ["DELETE /repos/{owner}/{repo}/actions/runs/{run_id}"],
-    deleteWorkflowRunLogs: ["DELETE /repos/{owner}/{repo}/actions/runs/{run_id}/logs"],
-    disableSelectedRepositoryGithubActionsOrganization: ["DELETE /orgs/{org}/actions/permissions/repositories/{repository_id}"],
-    disableWorkflow: ["PUT /repos/{owner}/{repo}/actions/workflows/{workflow_id}/disable"],
-    downloadArtifact: ["GET /repos/{owner}/{repo}/actions/artifacts/{artifact_id}/{archive_format}"],
-    downloadJobLogsForWorkflowRun: ["GET /repos/{owner}/{repo}/actions/jobs/{job_id}/logs"],
-    downloadWorkflowRunAttemptLogs: ["GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt_number}/logs"],
-    downloadWorkflowRunLogs: ["GET /repos/{owner}/{repo}/actions/runs/{run_id}/logs"],
-    enableSelectedRepositoryGithubActionsOrganization: ["PUT /orgs/{org}/actions/permissions/repositories/{repository_id}"],
-    enableWorkflow: ["PUT /repos/{owner}/{repo}/actions/workflows/{workflow_id}/enable"],
-    getActionsCacheList: ["GET /repos/{owner}/{repo}/actions/caches"],
-    getActionsCacheUsage: ["GET /repos/{owner}/{repo}/actions/cache/usage"],
-    getActionsCacheUsageByRepoForOrg: ["GET /orgs/{org}/actions/cache/usage-by-repository"],
-    getActionsCacheUsageForOrg: ["GET /orgs/{org}/actions/cache/usage"],
-    getAllowedActionsOrganization: ["GET /orgs/{org}/actions/permissions/selected-actions"],
-    getAllowedActionsRepository: ["GET /repos/{owner}/{repo}/actions/permissions/selected-actions"],
-    getArtifact: ["GET /repos/{owner}/{repo}/actions/artifacts/{artifact_id}"],
-    getEnvironmentPublicKey: ["GET /repositories/{repository_id}/environments/{environment_name}/secrets/public-key"],
-    getEnvironmentSecret: ["GET /repositories/{repository_id}/environments/{environment_name}/secrets/{secret_name}"],
-    getEnvironmentVariable: ["GET /repositories/{repository_id}/environments/{environment_name}/variables/{name}"],
-    getGithubActionsDefaultWorkflowPermissionsOrganization: ["GET /orgs/{org}/actions/permissions/workflow"],
-    getGithubActionsDefaultWorkflowPermissionsRepository: ["GET /repos/{owner}/{repo}/actions/permissions/workflow"],
-    getGithubActionsPermissionsOrganization: ["GET /orgs/{org}/actions/permissions"],
-    getGithubActionsPermissionsRepository: ["GET /repos/{owner}/{repo}/actions/permissions"],
-    getJobForWorkflowRun: ["GET /repos/{owner}/{repo}/actions/jobs/{job_id}"],
-    getOrgPublicKey: ["GET /orgs/{org}/actions/secrets/public-key"],
-    getOrgSecret: ["GET /orgs/{org}/actions/secrets/{secret_name}"],
-    getOrgVariable: ["GET /orgs/{org}/actions/variables/{name}"],
-    getPendingDeploymentsForRun: ["GET /repos/{owner}/{repo}/actions/runs/{run_id}/pending_deployments"],
-    getRepoPermissions: ["GET /repos/{owner}/{repo}/actions/permissions", {}, {
-      renamed: ["actions", "getGithubActionsPermissionsRepository"]
-    }],
-    getRepoPublicKey: ["GET /repos/{owner}/{repo}/actions/secrets/public-key"],
-    getRepoRequiredWorkflow: ["GET /repos/{org}/{repo}/actions/required_workflows/{required_workflow_id_for_repo}"],
-    getRepoRequiredWorkflowUsage: ["GET /repos/{org}/{repo}/actions/required_workflows/{required_workflow_id_for_repo}/timing"],
-    getRepoSecret: ["GET /repos/{owner}/{repo}/actions/secrets/{secret_name}"],
-    getRepoVariable: ["GET /repos/{owner}/{repo}/actions/variables/{name}"],
-    getRequiredWorkflow: ["GET /orgs/{org}/actions/required_workflows/{required_workflow_id}"],
-    getReviewsForRun: ["GET /repos/{owner}/{repo}/actions/runs/{run_id}/approvals"],
-    getSelfHostedRunnerForOrg: ["GET /orgs/{org}/actions/runners/{runner_id}"],
-    getSelfHostedRunnerForRepo: ["GET /repos/{owner}/{repo}/actions/runners/{runner_id}"],
-    getWorkflow: ["GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}"],
-    getWorkflowAccessToRepository: ["GET /repos/{owner}/{repo}/actions/permissions/access"],
-    getWorkflowRun: ["GET /repos/{owner}/{repo}/actions/runs/{run_id}"],
-    getWorkflowRunAttempt: ["GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt_number}"],
-    getWorkflowRunUsage: ["GET /repos/{owner}/{repo}/actions/runs/{run_id}/timing"],
-    getWorkflowUsage: ["GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/timing"],
-    listArtifactsForRepo: ["GET /repos/{owner}/{repo}/actions/artifacts"],
-    listEnvironmentSecrets: ["GET /repositories/{repository_id}/environments/{environment_name}/secrets"],
-    listEnvironmentVariables: ["GET /repositories/{repository_id}/environments/{environment_name}/variables"],
-    listJobsForWorkflowRun: ["GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs"],
-    listJobsForWorkflowRunAttempt: ["GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt_number}/jobs"],
-    listLabelsForSelfHostedRunnerForOrg: ["GET /orgs/{org}/actions/runners/{runner_id}/labels"],
-    listLabelsForSelfHostedRunnerForRepo: ["GET /repos/{owner}/{repo}/actions/runners/{runner_id}/labels"],
-    listOrgSecrets: ["GET /orgs/{org}/actions/secrets"],
-    listOrgVariables: ["GET /orgs/{org}/actions/variables"],
-    listRepoRequiredWorkflows: ["GET /repos/{org}/{repo}/actions/required_workflows"],
-    listRepoSecrets: ["GET /repos/{owner}/{repo}/actions/secrets"],
-    listRepoVariables: ["GET /repos/{owner}/{repo}/actions/variables"],
-    listRepoWorkflows: ["GET /repos/{owner}/{repo}/actions/workflows"],
-    listRequiredWorkflowRuns: ["GET /repos/{owner}/{repo}/actions/required_workflows/{required_workflow_id_for_repo}/runs"],
-    listRequiredWorkflows: ["GET /orgs/{org}/actions/required_workflows"],
-    listRunnerApplicationsForOrg: ["GET /orgs/{org}/actions/runners/downloads"],
-    listRunnerApplicationsForRepo: ["GET /repos/{owner}/{repo}/actions/runners/downloads"],
-    listSelectedReposForOrgSecret: ["GET /orgs/{org}/actions/secrets/{secret_name}/repositories"],
-    listSelectedReposForOrgVariable: ["GET /orgs/{org}/actions/variables/{name}/repositories"],
-    listSelectedRepositoriesEnabledGithubActionsOrganization: ["GET /orgs/{org}/actions/permissions/repositories"],
-    listSelectedRepositoriesRequiredWorkflow: ["GET /orgs/{org}/actions/required_workflows/{required_workflow_id}/repositories"],
-    listSelfHostedRunnersForOrg: ["GET /orgs/{org}/actions/runners"],
-    listSelfHostedRunnersForRepo: ["GET /repos/{owner}/{repo}/actions/runners"],
-    listWorkflowRunArtifacts: ["GET /repos/{owner}/{repo}/actions/runs/{run_id}/artifacts"],
-    listWorkflowRuns: ["GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs"],
-    listWorkflowRunsForRepo: ["GET /repos/{owner}/{repo}/actions/runs"],
-    reRunJobForWorkflowRun: ["POST /repos/{owner}/{repo}/actions/jobs/{job_id}/rerun"],
-    reRunWorkflow: ["POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun"],
-    reRunWorkflowFailedJobs: ["POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs"],
-    removeAllCustomLabelsFromSelfHostedRunnerForOrg: ["DELETE /orgs/{org}/actions/runners/{runner_id}/labels"],
-    removeAllCustomLabelsFromSelfHostedRunnerForRepo: ["DELETE /repos/{owner}/{repo}/actions/runners/{runner_id}/labels"],
-    removeCustomLabelFromSelfHostedRunnerForOrg: ["DELETE /orgs/{org}/actions/runners/{runner_id}/labels/{name}"],
-    removeCustomLabelFromSelfHostedRunnerForRepo: ["DELETE /repos/{owner}/{repo}/actions/runners/{runner_id}/labels/{name}"],
-    removeSelectedRepoFromOrgSecret: ["DELETE /orgs/{org}/actions/secrets/{secret_name}/repositories/{repository_id}"],
-    removeSelectedRepoFromOrgVariable: ["DELETE /orgs/{org}/actions/variables/{name}/repositories/{repository_id}"],
-    removeSelectedRepoFromRequiredWorkflow: ["DELETE /orgs/{org}/actions/required_workflows/{required_workflow_id}/repositories/{repository_id}"],
-    reviewPendingDeploymentsForRun: ["POST /repos/{owner}/{repo}/actions/runs/{run_id}/pending_deployments"],
-    setAllowedActionsOrganization: ["PUT /orgs/{org}/actions/permissions/selected-actions"],
-    setAllowedActionsRepository: ["PUT /repos/{owner}/{repo}/actions/permissions/selected-actions"],
-    setCustomLabelsForSelfHostedRunnerForOrg: ["PUT /orgs/{org}/actions/runners/{runner_id}/labels"],
-    setCustomLabelsForSelfHostedRunnerForRepo: ["PUT /repos/{owner}/{repo}/actions/runners/{runner_id}/labels"],
-    setGithubActionsDefaultWorkflowPermissionsOrganization: ["PUT /orgs/{org}/actions/permissions/workflow"],
-    setGithubActionsDefaultWorkflowPermissionsRepository: ["PUT /repos/{owner}/{repo}/actions/permissions/workflow"],
-    setGithubActionsPermissionsOrganization: ["PUT /orgs/{org}/actions/permissions"],
-    setGithubActionsPermissionsRepository: ["PUT /repos/{owner}/{repo}/actions/permissions"],
-    setSelectedReposForOrgSecret: ["PUT /orgs/{org}/actions/secrets/{secret_name}/repositories"],
-    setSelectedReposForOrgVariable: ["PUT /orgs/{org}/actions/variables/{name}/repositories"],
-    setSelectedReposToRequiredWorkflow: ["PUT /orgs/{org}/actions/required_workflows/{required_workflow_id}/repositories"],
-    setSelectedRepositoriesEnabledGithubActionsOrganization: ["PUT /orgs/{org}/actions/permissions/repositories"],
-    setWorkflowAccessToRepository: ["PUT /repos/{owner}/{repo}/actions/permissions/access"],
-    updateEnvironmentVariable: ["PATCH /repositories/{repository_id}/environments/{environment_name}/variables/{name}"],
-    updateOrgVariable: ["PATCH /orgs/{org}/actions/variables/{name}"],
-    updateRepoVariable: ["PATCH /repos/{owner}/{repo}/actions/variables/{name}"],
-    updateRequiredWorkflow: ["PATCH /orgs/{org}/actions/required_workflows/{required_workflow_id}"]
-  },
-  activity: {
-    checkRepoIsStarredByAuthenticatedUser: ["GET /user/starred/{owner}/{repo}"],
-    deleteRepoSubscription: ["DELETE /repos/{owner}/{repo}/subscription"],
-    deleteThreadSubscription: ["DELETE /notifications/threads/{thread_id}/subscription"],
-    getFeeds: ["GET /feeds"],
-    getRepoSubscription: ["GET /repos/{owner}/{repo}/subscription"],
-    getThread: ["GET /notifications/threads/{thread_id}"],
-    getThreadSubscriptionForAuthenticatedUser: ["GET /notifications/threads/{thread_id}/subscription"],
-    listEventsForAuthenticatedUser: ["GET /users/{username}/events"],
-    listNotificationsForAuthenticatedUser: ["GET /notifications"],
-    listOrgEventsForAuthenticatedUser: ["GET /users/{username}/events/orgs/{org}"],
-    listPublicEvents: ["GET /events"],
-    listPublicEventsForRepoNetwork: ["GET /networks/{owner}/{repo}/events"],
-    listPublicEventsForUser: ["GET /users/{username}/events/public"],
-    listPublicOrgEvents: ["GET /orgs/{org}/events"],
-    listReceivedEventsForUser: ["GET /users/{username}/received_events"],
-    listReceivedPublicEventsForUser: ["GET /users/{username}/received_events/public"],
-    listRepoEvents: ["GET /repos/{owner}/{repo}/events"],
-    listRepoNotificationsForAuthenticatedUser: ["GET /repos/{owner}/{repo}/notifications"],
-    listReposStarredByAuthenticatedUser: ["GET /user/starred"],
-    listReposStarredByUser: ["GET /users/{username}/starred"],
-    listReposWatchedByUser: ["GET /users/{username}/subscriptions"],
-    listStargazersForRepo: ["GET /repos/{owner}/{repo}/stargazers"],
-    listWatchedReposForAuthenticatedUser: ["GET /user/subscriptions"],
-    listWatchersForRepo: ["GET /repos/{owner}/{repo}/subscribers"],
-    markNotificationsAsRead: ["PUT /notifications"],
-    markRepoNotificationsAsRead: ["PUT /repos/{owner}/{repo}/notifications"],
-    markThreadAsRead: ["PATCH /notifications/threads/{thread_id}"],
-    setRepoSubscription: ["PUT /repos/{owner}/{repo}/subscription"],
-    setThreadSubscription: ["PUT /notifications/threads/{thread_id}/subscription"],
-    starRepoForAuthenticatedUser: ["PUT /user/starred/{owner}/{repo}"],
-    unstarRepoForAuthenticatedUser: ["DELETE /user/starred/{owner}/{repo}"]
-  },
-  apps: {
-    addRepoToInstallation: ["PUT /user/installations/{installation_id}/repositories/{repository_id}", {}, {
-      renamed: ["apps", "addRepoToInstallationForAuthenticatedUser"]
-    }],
-    addRepoToInstallationForAuthenticatedUser: ["PUT /user/installations/{installation_id}/repositories/{repository_id}"],
-    checkToken: ["POST /applications/{client_id}/token"],
-    createFromManifest: ["POST /app-manifests/{code}/conversions"],
-    createInstallationAccessToken: ["POST /app/installations/{installation_id}/access_tokens"],
-    deleteAuthorization: ["DELETE /applications/{client_id}/grant"],
-    deleteInstallation: ["DELETE /app/installations/{installation_id}"],
-    deleteToken: ["DELETE /applications/{client_id}/token"],
-    getAuthenticated: ["GET /app"],
-    getBySlug: ["GET /apps/{app_slug}"],
-    getInstallation: ["GET /app/installations/{installation_id}"],
-    getOrgInstallation: ["GET /orgs/{org}/installation"],
-    getRepoInstallation: ["GET /repos/{owner}/{repo}/installation"],
-    getSubscriptionPlanForAccount: ["GET /marketplace_listing/accounts/{account_id}"],
-    getSubscriptionPlanForAccountStubbed: ["GET /marketplace_listing/stubbed/accounts/{account_id}"],
-    getUserInstallation: ["GET /users/{username}/installation"],
-    getWebhookConfigForApp: ["GET /app/hook/config"],
-    getWebhookDelivery: ["GET /app/hook/deliveries/{delivery_id}"],
-    listAccountsForPlan: ["GET /marketplace_listing/plans/{plan_id}/accounts"],
-    listAccountsForPlanStubbed: ["GET /marketplace_listing/stubbed/plans/{plan_id}/accounts"],
-    listInstallationReposForAuthenticatedUser: ["GET /user/installations/{installation_id}/repositories"],
-    listInstallations: ["GET /app/installations"],
-    listInstallationsForAuthenticatedUser: ["GET /user/installations"],
-    listPlans: ["GET /marketplace_listing/plans"],
-    listPlansStubbed: ["GET /marketplace_listing/stubbed/plans"],
-    listReposAccessibleToInstallation: ["GET /installation/repositories"],
-    listSubscriptionsForAuthenticatedUser: ["GET /user/marketplace_purchases"],
-    listSubscriptionsForAuthenticatedUserStubbed: ["GET /user/marketplace_purchases/stubbed"],
-    listWebhookDeliveries: ["GET /app/hook/deliveries"],
-    redeliverWebhookDelivery: ["POST /app/hook/deliveries/{delivery_id}/attempts"],
-    removeRepoFromInstallation: ["DELETE /user/installations/{installation_id}/repositories/{repository_id}", {}, {
-      renamed: ["apps", "removeRepoFromInstallationForAuthenticatedUser"]
-    }],
-    removeRepoFromInstallationForAuthenticatedUser: ["DELETE /user/installations/{installation_id}/repositories/{repository_id}"],
-    resetToken: ["PATCH /applications/{client_id}/token"],
-    revokeInstallationAccessToken: ["DELETE /installation/token"],
-    scopeToken: ["POST /applications/{client_id}/token/scoped"],
-    suspendInstallation: ["PUT /app/installations/{installation_id}/suspended"],
-    unsuspendInstallation: ["DELETE /app/installations/{installation_id}/suspended"],
-    updateWebhookConfigForApp: ["PATCH /app/hook/config"]
-  },
-  billing: {
-    getGithubActionsBillingOrg: ["GET /orgs/{org}/settings/billing/actions"],
-    getGithubActionsBillingUser: ["GET /users/{username}/settings/billing/actions"],
-    getGithubPackagesBillingOrg: ["GET /orgs/{org}/settings/billing/packages"],
-    getGithubPackagesBillingUser: ["GET /users/{username}/settings/billing/packages"],
-    getSharedStorageBillingOrg: ["GET /orgs/{org}/settings/billing/shared-storage"],
-    getSharedStorageBillingUser: ["GET /users/{username}/settings/billing/shared-storage"]
-  },
-  checks: {
-    create: ["POST /repos/{owner}/{repo}/check-runs"],
-    createSuite: ["POST /repos/{owner}/{repo}/check-suites"],
-    get: ["GET /repos/{owner}/{repo}/check-runs/{check_run_id}"],
-    getSuite: ["GET /repos/{owner}/{repo}/check-suites/{check_suite_id}"],
-    listAnnotations: ["GET /repos/{owner}/{repo}/check-runs/{check_run_id}/annotations"],
-    listForRef: ["GET /repos/{owner}/{repo}/commits/{ref}/check-runs"],
-    listForSuite: ["GET /repos/{owner}/{repo}/check-suites/{check_suite_id}/check-runs"],
-    listSuitesForRef: ["GET /repos/{owner}/{repo}/commits/{ref}/check-suites"],
-    rerequestRun: ["POST /repos/{owner}/{repo}/check-runs/{check_run_id}/rerequest"],
-    rerequestSuite: ["POST /repos/{owner}/{repo}/check-suites/{check_suite_id}/rerequest"],
-    setSuitesPreferences: ["PATCH /repos/{owner}/{repo}/check-suites/preferences"],
-    update: ["PATCH /repos/{owner}/{repo}/check-runs/{check_run_id}"]
-  },
-  codeScanning: {
-    deleteAnalysis: ["DELETE /repos/{owner}/{repo}/code-scanning/analyses/{analysis_id}{?confirm_delete}"],
-    getAlert: ["GET /repos/{owner}/{repo}/code-scanning/alerts/{alert_number}", {}, {
-      renamedParameters: {
-        alert_id: "alert_number"
-      }
-    }],
-    getAnalysis: ["GET /repos/{owner}/{repo}/code-scanning/analyses/{analysis_id}"],
-    getCodeqlDatabase: ["GET /repos/{owner}/{repo}/code-scanning/codeql/databases/{language}"],
-    getSarif: ["GET /repos/{owner}/{repo}/code-scanning/sarifs/{sarif_id}"],
-    listAlertInstances: ["GET /repos/{owner}/{repo}/code-scanning/alerts/{alert_number}/instances"],
-    listAlertsForOrg: ["GET /orgs/{org}/code-scanning/alerts"],
-    listAlertsForRepo: ["GET /repos/{owner}/{repo}/code-scanning/alerts"],
-    listAlertsInstances: ["GET /repos/{owner}/{repo}/code-scanning/alerts/{alert_number}/instances", {}, {
-      renamed: ["codeScanning", "listAlertInstances"]
-    }],
-    listCodeqlDatabases: ["GET /repos/{owner}/{repo}/code-scanning/codeql/databases"],
-    listRecentAnalyses: ["GET /repos/{owner}/{repo}/code-scanning/analyses"],
-    updateAlert: ["PATCH /repos/{owner}/{repo}/code-scanning/alerts/{alert_number}"],
-    uploadSarif: ["POST /repos/{owner}/{repo}/code-scanning/sarifs"]
-  },
-  codesOfConduct: {
-    getAllCodesOfConduct: ["GET /codes_of_conduct"],
-    getConductCode: ["GET /codes_of_conduct/{key}"]
-  },
-  codespaces: {
-    addRepositoryForSecretForAuthenticatedUser: ["PUT /user/codespaces/secrets/{secret_name}/repositories/{repository_id}"],
-    addSelectedRepoToOrgSecret: ["PUT /orgs/{org}/codespaces/secrets/{secret_name}/repositories/{repository_id}"],
-    codespaceMachinesForAuthenticatedUser: ["GET /user/codespaces/{codespace_name}/machines"],
-    createForAuthenticatedUser: ["POST /user/codespaces"],
-    createOrUpdateOrgSecret: ["PUT /orgs/{org}/codespaces/secrets/{secret_name}"],
-    createOrUpdateRepoSecret: ["PUT /repos/{owner}/{repo}/codespaces/secrets/{secret_name}"],
-    createOrUpdateSecretForAuthenticatedUser: ["PUT /user/codespaces/secrets/{secret_name}"],
-    createWithPrForAuthenticatedUser: ["POST /repos/{owner}/{repo}/pulls/{pull_number}/codespaces"],
-    createWithRepoForAuthenticatedUser: ["POST /repos/{owner}/{repo}/codespaces"],
-    deleteForAuthenticatedUser: ["DELETE /user/codespaces/{codespace_name}"],
-    deleteFromOrganization: ["DELETE /orgs/{org}/members/{username}/codespaces/{codespace_name}"],
-    deleteOrgSecret: ["DELETE /orgs/{org}/codespaces/secrets/{secret_name}"],
-    deleteRepoSecret: ["DELETE /repos/{owner}/{repo}/codespaces/secrets/{secret_name}"],
-    deleteSecretForAuthenticatedUser: ["DELETE /user/codespaces/secrets/{secret_name}"],
-    exportForAuthenticatedUser: ["POST /user/codespaces/{codespace_name}/exports"],
-    getCodespacesForUserInOrg: ["GET /orgs/{org}/members/{username}/codespaces"],
-    getExportDetailsForAuthenticatedUser: ["GET /user/codespaces/{codespace_name}/exports/{export_id}"],
-    getForAuthenticatedUser: ["GET /user/codespaces/{codespace_name}"],
-    getOrgPublicKey: ["GET /orgs/{org}/codespaces/secrets/public-key"],
-    getOrgSecret: ["GET /orgs/{org}/codespaces/secrets/{secret_name}"],
-    getPublicKeyForAuthenticatedUser: ["GET /user/codespaces/secrets/public-key"],
-    getRepoPublicKey: ["GET /repos/{owner}/{repo}/codespaces/secrets/public-key"],
-    getRepoSecret: ["GET /repos/{owner}/{repo}/codespaces/secrets/{secret_name}"],
-    getSecretForAuthenticatedUser: ["GET /user/codespaces/secrets/{secret_name}"],
-    listDevcontainersInRepositoryForAuthenticatedUser: ["GET /repos/{owner}/{repo}/codespaces/devcontainers"],
-    listForAuthenticatedUser: ["GET /user/codespaces"],
-    listInOrganization: ["GET /orgs/{org}/codespaces", {}, {
-      renamedParameters: {
-        org_id: "org"
-      }
-    }],
-    listInRepositoryForAuthenticatedUser: ["GET /repos/{owner}/{repo}/codespaces"],
-    listOrgSecrets: ["GET /orgs/{org}/codespaces/secrets"],
-    listRepoSecrets: ["GET /repos/{owner}/{repo}/codespaces/secrets"],
-    listRepositoriesForSecretForAuthenticatedUser: ["GET /user/codespaces/secrets/{secret_name}/repositories"],
-    listSecretsForAuthenticatedUser: ["GET /user/codespaces/secrets"],
-    listSelectedReposForOrgSecret: ["GET /orgs/{org}/codespaces/secrets/{secret_name}/repositories"],
-    preFlightWithRepoForAuthenticatedUser: ["GET /repos/{owner}/{repo}/codespaces/new"],
-    publishForAuthenticatedUser: ["POST /user/codespaces/{codespace_name}/publish"],
-    removeRepositoryForSecretForAuthenticatedUser: ["DELETE /user/codespaces/secrets/{secret_name}/repositories/{repository_id}"],
-    removeSelectedRepoFromOrgSecret: ["DELETE /orgs/{org}/codespaces/secrets/{secret_name}/repositories/{repository_id}"],
-    repoMachinesForAuthenticatedUser: ["GET /repos/{owner}/{repo}/codespaces/machines"],
-    setCodespacesBilling: ["PUT /orgs/{org}/codespaces/billing"],
-    setRepositoriesForSecretForAuthenticatedUser: ["PUT /user/codespaces/secrets/{secret_name}/repositories"],
-    setSelectedReposForOrgSecret: ["PUT /orgs/{org}/codespaces/secrets/{secret_name}/repositories"],
-    startForAuthenticatedUser: ["POST /user/codespaces/{codespace_name}/start"],
-    stopForAuthenticatedUser: ["POST /user/codespaces/{codespace_name}/stop"],
-    stopInOrganization: ["POST /orgs/{org}/members/{username}/codespaces/{codespace_name}/stop"],
-    updateForAuthenticatedUser: ["PATCH /user/codespaces/{codespace_name}"]
-  },
-  dependabot: {
-    addSelectedRepoToOrgSecret: ["PUT /orgs/{org}/dependabot/secrets/{secret_name}/repositories/{repository_id}"],
-    createOrUpdateOrgSecret: ["PUT /orgs/{org}/dependabot/secrets/{secret_name}"],
-    createOrUpdateRepoSecret: ["PUT /repos/{owner}/{repo}/dependabot/secrets/{secret_name}"],
-    deleteOrgSecret: ["DELETE /orgs/{org}/dependabot/secrets/{secret_name}"],
-    deleteRepoSecret: ["DELETE /repos/{owner}/{repo}/dependabot/secrets/{secret_name}"],
-    getAlert: ["GET /repos/{owner}/{repo}/dependabot/alerts/{alert_number}"],
-    getOrgPublicKey: ["GET /orgs/{org}/dependabot/secrets/public-key"],
-    getOrgSecret: ["GET /orgs/{org}/dependabot/secrets/{secret_name}"],
-    getRepoPublicKey: ["GET /repos/{owner}/{repo}/dependabot/secrets/public-key"],
-    getRepoSecret: ["GET /repos/{owner}/{repo}/dependabot/secrets/{secret_name}"],
-    listAlertsForEnterprise: ["GET /enterprises/{enterprise}/dependabot/alerts"],
-    listAlertsForOrg: ["GET /orgs/{org}/dependabot/alerts"],
-    listAlertsForRepo: ["GET /repos/{owner}/{repo}/dependabot/alerts"],
-    listOrgSecrets: ["GET /orgs/{org}/dependabot/secrets"],
-    listRepoSecrets: ["GET /repos/{owner}/{repo}/dependabot/secrets"],
-    listSelectedReposForOrgSecret: ["GET /orgs/{org}/dependabot/secrets/{secret_name}/repositories"],
-    removeSelectedRepoFromOrgSecret: ["DELETE /orgs/{org}/dependabot/secrets/{secret_name}/repositories/{repository_id}"],
-    setSelectedReposForOrgSecret: ["PUT /orgs/{org}/dependabot/secrets/{secret_name}/repositories"],
-    updateAlert: ["PATCH /repos/{owner}/{repo}/dependabot/alerts/{alert_number}"]
-  },
-  dependencyGraph: {
-    createRepositorySnapshot: ["POST /repos/{owner}/{repo}/dependency-graph/snapshots"],
-    diffRange: ["GET /repos/{owner}/{repo}/dependency-graph/compare/{basehead}"]
-  },
-  emojis: {
-    get: ["GET /emojis"]
-  },
-  enterpriseAdmin: {
-    addCustomLabelsToSelfHostedRunnerForEnterprise: ["POST /enterprises/{enterprise}/actions/runners/{runner_id}/labels"],
-    enableSelectedOrganizationGithubActionsEnterprise: ["PUT /enterprises/{enterprise}/actions/permissions/organizations/{org_id}"],
-    listLabelsForSelfHostedRunnerForEnterprise: ["GET /enterprises/{enterprise}/actions/runners/{runner_id}/labels"]
-  },
-  gists: {
-    checkIsStarred: ["GET /gists/{gist_id}/star"],
-    create: ["POST /gists"],
-    createComment: ["POST /gists/{gist_id}/comments"],
-    delete: ["DELETE /gists/{gist_id}"],
-    deleteComment: ["DELETE /gists/{gist_id}/comments/{comment_id}"],
-    fork: ["POST /gists/{gist_id}/forks"],
-    get: ["GET /gists/{gist_id}"],
-    getComment: ["GET /gists/{gist_id}/comments/{comment_id}"],
-    getRevision: ["GET /gists/{gist_id}/{sha}"],
-    list: ["GET /gists"],
-    listComments: ["GET /gists/{gist_id}/comments"],
-    listCommits: ["GET /gists/{gist_id}/commits"],
-    listForUser: ["GET /users/{username}/gists"],
-    listForks: ["GET /gists/{gist_id}/forks"],
-    listPublic: ["GET /gists/public"],
-    listStarred: ["GET /gists/starred"],
-    star: ["PUT /gists/{gist_id}/star"],
-    unstar: ["DELETE /gists/{gist_id}/star"],
-    update: ["PATCH /gists/{gist_id}"],
-    updateComment: ["PATCH /gists/{gist_id}/comments/{comment_id}"]
-  },
-  git: {
-    createBlob: ["POST /repos/{owner}/{repo}/git/blobs"],
-    createCommit: ["POST /repos/{owner}/{repo}/git/commits"],
-    createRef: ["POST /repos/{owner}/{repo}/git/refs"],
-    createTag: ["POST /repos/{owner}/{repo}/git/tags"],
-    createTree: ["POST /repos/{owner}/{repo}/git/trees"],
-    deleteRef: ["DELETE /repos/{owner}/{repo}/git/refs/{ref}"],
-    getBlob: ["GET /repos/{owner}/{repo}/git/blobs/{file_sha}"],
-    getCommit: ["GET /repos/{owner}/{repo}/git/commits/{commit_sha}"],
-    getRef: ["GET /repos/{owner}/{repo}/git/ref/{ref}"],
-    getTag: ["GET /repos/{owner}/{repo}/git/tags/{tag_sha}"],
-    getTree: ["GET /repos/{owner}/{repo}/git/trees/{tree_sha}"],
-    listMatchingRefs: ["GET /repos/{owner}/{repo}/git/matching-refs/{ref}"],
-    updateRef: ["PATCH /repos/{owner}/{repo}/git/refs/{ref}"]
-  },
-  gitignore: {
-    getAllTemplates: ["GET /gitignore/templates"],
-    getTemplate: ["GET /gitignore/templates/{name}"]
-  },
-  interactions: {
-    getRestrictionsForAuthenticatedUser: ["GET /user/interaction-limits"],
-    getRestrictionsForOrg: ["GET /orgs/{org}/interaction-limits"],
-    getRestrictionsForRepo: ["GET /repos/{owner}/{repo}/interaction-limits"],
-    getRestrictionsForYourPublicRepos: ["GET /user/interaction-limits", {}, {
-      renamed: ["interactions", "getRestrictionsForAuthenticatedUser"]
-    }],
-    removeRestrictionsForAuthenticatedUser: ["DELETE /user/interaction-limits"],
-    removeRestrictionsForOrg: ["DELETE /orgs/{org}/interaction-limits"],
-    removeRestrictionsForRepo: ["DELETE /repos/{owner}/{repo}/interaction-limits"],
-    removeRestrictionsForYourPublicRepos: ["DELETE /user/interaction-limits", {}, {
-      renamed: ["interactions", "removeRestrictionsForAuthenticatedUser"]
-    }],
-    setRestrictionsForAuthenticatedUser: ["PUT /user/interaction-limits"],
-    setRestrictionsForOrg: ["PUT /orgs/{org}/interaction-limits"],
-    setRestrictionsForRepo: ["PUT /repos/{owner}/{repo}/interaction-limits"],
-    setRestrictionsForYourPublicRepos: ["PUT /user/interaction-limits", {}, {
-      renamed: ["interactions", "setRestrictionsForAuthenticatedUser"]
-    }]
-  },
-  issues: {
-    addAssignees: ["POST /repos/{owner}/{repo}/issues/{issue_number}/assignees"],
-    addLabels: ["POST /repos/{owner}/{repo}/issues/{issue_number}/labels"],
-    checkUserCanBeAssigned: ["GET /repos/{owner}/{repo}/assignees/{assignee}"],
-    checkUserCanBeAssignedToIssue: ["GET /repos/{owner}/{repo}/issues/{issue_number}/assignees/{assignee}"],
-    create: ["POST /repos/{owner}/{repo}/issues"],
-    createComment: ["POST /repos/{owner}/{repo}/issues/{issue_number}/comments"],
-    createLabel: ["POST /repos/{owner}/{repo}/labels"],
-    createMilestone: ["POST /repos/{owner}/{repo}/milestones"],
-    deleteComment: ["DELETE /repos/{owner}/{repo}/issues/comments/{comment_id}"],
-    deleteLabel: ["DELETE /repos/{owner}/{repo}/labels/{name}"],
-    deleteMilestone: ["DELETE /repos/{owner}/{repo}/milestones/{milestone_number}"],
-    get: ["GET /repos/{owner}/{repo}/issues/{issue_number}"],
-    getComment: ["GET /repos/{owner}/{repo}/issues/comments/{comment_id}"],
-    getEvent: ["GET /repos/{owner}/{repo}/issues/events/{event_id}"],
-    getLabel: ["GET /repos/{owner}/{repo}/labels/{name}"],
-    getMilestone: ["GET /repos/{owner}/{repo}/milestones/{milestone_number}"],
-    list: ["GET /issues"],
-    listAssignees: ["GET /repos/{owner}/{repo}/assignees"],
-    listComments: ["GET /repos/{owner}/{repo}/issues/{issue_number}/comments"],
-    listCommentsForRepo: ["GET /repos/{owner}/{repo}/issues/comments"],
-    listEvents: ["GET /repos/{owner}/{repo}/issues/{issue_number}/events"],
-    listEventsForRepo: ["GET /repos/{owner}/{repo}/issues/events"],
-    listEventsForTimeline: ["GET /repos/{owner}/{repo}/issues/{issue_number}/timeline"],
-    listForAuthenticatedUser: ["GET /user/issues"],
-    listForOrg: ["GET /orgs/{org}/issues"],
-    listForRepo: ["GET /repos/{owner}/{repo}/issues"],
-    listLabelsForMilestone: ["GET /repos/{owner}/{repo}/milestones/{milestone_number}/labels"],
-    listLabelsForRepo: ["GET /repos/{owner}/{repo}/labels"],
-    listLabelsOnIssue: ["GET /repos/{owner}/{repo}/issues/{issue_number}/labels"],
-    listMilestones: ["GET /repos/{owner}/{repo}/milestones"],
-    lock: ["PUT /repos/{owner}/{repo}/issues/{issue_number}/lock"],
-    removeAllLabels: ["DELETE /repos/{owner}/{repo}/issues/{issue_number}/labels"],
-    removeAssignees: ["DELETE /repos/{owner}/{repo}/issues/{issue_number}/assignees"],
-    removeLabel: ["DELETE /repos/{owner}/{repo}/issues/{issue_number}/labels/{name}"],
-    setLabels: ["PUT /repos/{owner}/{repo}/issues/{issue_number}/labels"],
-    unlock: ["DELETE /repos/{owner}/{repo}/issues/{issue_number}/lock"],
-    update: ["PATCH /repos/{owner}/{repo}/issues/{issue_number}"],
-    updateComment: ["PATCH /repos/{owner}/{repo}/issues/comments/{comment_id}"],
-    updateLabel: ["PATCH /repos/{owner}/{repo}/labels/{name}"],
-    updateMilestone: ["PATCH /repos/{owner}/{repo}/milestones/{milestone_number}"]
-  },
-  licenses: {
-    get: ["GET /licenses/{license}"],
-    getAllCommonlyUsed: ["GET /licenses"],
-    getForRepo: ["GET /repos/{owner}/{repo}/license"]
-  },
-  markdown: {
-    render: ["POST /markdown"],
-    renderRaw: ["POST /markdown/raw", {
-      headers: {
-        "content-type": "text/plain; charset=utf-8"
-      }
-    }]
-  },
-  meta: {
-    get: ["GET /meta"],
-    getAllVersions: ["GET /versions"],
-    getOctocat: ["GET /octocat"],
-    getZen: ["GET /zen"],
-    root: ["GET /"]
-  },
-  migrations: {
-    cancelImport: ["DELETE /repos/{owner}/{repo}/import"],
-    deleteArchiveForAuthenticatedUser: ["DELETE /user/migrations/{migration_id}/archive"],
-    deleteArchiveForOrg: ["DELETE /orgs/{org}/migrations/{migration_id}/archive"],
-    downloadArchiveForOrg: ["GET /orgs/{org}/migrations/{migration_id}/archive"],
-    getArchiveForAuthenticatedUser: ["GET /user/migrations/{migration_id}/archive"],
-    getCommitAuthors: ["GET /repos/{owner}/{repo}/import/authors"],
-    getImportStatus: ["GET /repos/{owner}/{repo}/import"],
-    getLargeFiles: ["GET /repos/{owner}/{repo}/import/large_files"],
-    getStatusForAuthenticatedUser: ["GET /user/migrations/{migration_id}"],
-    getStatusForOrg: ["GET /orgs/{org}/migrations/{migration_id}"],
-    listForAuthenticatedUser: ["GET /user/migrations"],
-    listForOrg: ["GET /orgs/{org}/migrations"],
-    listReposForAuthenticatedUser: ["GET /user/migrations/{migration_id}/repositories"],
-    listReposForOrg: ["GET /orgs/{org}/migrations/{migration_id}/repositories"],
-    listReposForUser: ["GET /user/migrations/{migration_id}/repositories", {}, {
-      renamed: ["migrations", "listReposForAuthenticatedUser"]
-    }],
-    mapCommitAuthor: ["PATCH /repos/{owner}/{repo}/import/authors/{author_id}"],
-    setLfsPreference: ["PATCH /repos/{owner}/{repo}/import/lfs"],
-    startForAuthenticatedUser: ["POST /user/migrations"],
-    startForOrg: ["POST /orgs/{org}/migrations"],
-    startImport: ["PUT /repos/{owner}/{repo}/import"],
-    unlockRepoForAuthenticatedUser: ["DELETE /user/migrations/{migration_id}/repos/{repo_name}/lock"],
-    unlockRepoForOrg: ["DELETE /orgs/{org}/migrations/{migration_id}/repos/{repo_name}/lock"],
-    updateImport: ["PATCH /repos/{owner}/{repo}/import"]
-  },
-  orgs: {
-    addSecurityManagerTeam: ["PUT /orgs/{org}/security-managers/teams/{team_slug}"],
-    blockUser: ["PUT /orgs/{org}/blocks/{username}"],
-    cancelInvitation: ["DELETE /orgs/{org}/invitations/{invitation_id}"],
-    checkBlockedUser: ["GET /orgs/{org}/blocks/{username}"],
-    checkMembershipForUser: ["GET /orgs/{org}/members/{username}"],
-    checkPublicMembershipForUser: ["GET /orgs/{org}/public_members/{username}"],
-    convertMemberToOutsideCollaborator: ["PUT /orgs/{org}/outside_collaborators/{username}"],
-    createInvitation: ["POST /orgs/{org}/invitations"],
-    createWebhook: ["POST /orgs/{org}/hooks"],
-    deleteWebhook: ["DELETE /orgs/{org}/hooks/{hook_id}"],
-    enableOrDisableSecurityProductOnAllOrgRepos: ["POST /orgs/{org}/{security_product}/{enablement}"],
-    get: ["GET /orgs/{org}"],
-    getMembershipForAuthenticatedUser: ["GET /user/memberships/orgs/{org}"],
-    getMembershipForUser: ["GET /orgs/{org}/memberships/{username}"],
-    getWebhook: ["GET /orgs/{org}/hooks/{hook_id}"],
-    getWebhookConfigForOrg: ["GET /orgs/{org}/hooks/{hook_id}/config"],
-    getWebhookDelivery: ["GET /orgs/{org}/hooks/{hook_id}/deliveries/{delivery_id}"],
-    list: ["GET /organizations"],
-    listAppInstallations: ["GET /orgs/{org}/installations"],
-    listBlockedUsers: ["GET /orgs/{org}/blocks"],
-    listFailedInvitations: ["GET /orgs/{org}/failed_invitations"],
-    listForAuthenticatedUser: ["GET /user/orgs"],
-    listForUser: ["GET /users/{username}/orgs"],
-    listInvitationTeams: ["GET /orgs/{org}/invitations/{invitation_id}/teams"],
-    listMembers: ["GET /orgs/{org}/members"],
-    listMembershipsForAuthenticatedUser: ["GET /user/memberships/orgs"],
-    listOutsideCollaborators: ["GET /orgs/{org}/outside_collaborators"],
-    listPendingInvitations: ["GET /orgs/{org}/invitations"],
-    listPublicMembers: ["GET /orgs/{org}/public_members"],
-    listSecurityManagerTeams: ["GET /orgs/{org}/security-managers"],
-    listWebhookDeliveries: ["GET /orgs/{org}/hooks/{hook_id}/deliveries"],
-    listWebhooks: ["GET /orgs/{org}/hooks"],
-    pingWebhook: ["POST /orgs/{org}/hooks/{hook_id}/pings"],
-    redeliverWebhookDelivery: ["POST /orgs/{org}/hooks/{hook_id}/deliveries/{delivery_id}/attempts"],
-    removeMember: ["DELETE /orgs/{org}/members/{username}"],
-    removeMembershipForUser: ["DELETE /orgs/{org}/memberships/{username}"],
-    removeOutsideCollaborator: ["DELETE /orgs/{org}/outside_collaborators/{username}"],
-    removePublicMembershipForAuthenticatedUser: ["DELETE /orgs/{org}/public_members/{username}"],
-    removeSecurityManagerTeam: ["DELETE /orgs/{org}/security-managers/teams/{team_slug}"],
-    setMembershipForUser: ["PUT /orgs/{org}/memberships/{username}"],
-    setPublicMembershipForAuthenticatedUser: ["PUT /orgs/{org}/public_members/{username}"],
-    unblockUser: ["DELETE /orgs/{org}/blocks/{username}"],
-    update: ["PATCH /orgs/{org}"],
-    updateMembershipForAuthenticatedUser: ["PATCH /user/memberships/orgs/{org}"],
-    updateWebhook: ["PATCH /orgs/{org}/hooks/{hook_id}"],
-    updateWebhookConfigForOrg: ["PATCH /orgs/{org}/hooks/{hook_id}/config"]
-  },
-  packages: {
-    deletePackageForAuthenticatedUser: ["DELETE /user/packages/{package_type}/{package_name}"],
-    deletePackageForOrg: ["DELETE /orgs/{org}/packages/{package_type}/{package_name}"],
-    deletePackageForUser: ["DELETE /users/{username}/packages/{package_type}/{package_name}"],
-    deletePackageVersionForAuthenticatedUser: ["DELETE /user/packages/{package_type}/{package_name}/versions/{package_version_id}"],
-    deletePackageVersionForOrg: ["DELETE /orgs/{org}/packages/{package_type}/{package_name}/versions/{package_version_id}"],
-    deletePackageVersionForUser: ["DELETE /users/{username}/packages/{package_type}/{package_name}/versions/{package_version_id}"],
-    getAllPackageVersionsForAPackageOwnedByAnOrg: ["GET /orgs/{org}/packages/{package_type}/{package_name}/versions", {}, {
-      renamed: ["packages", "getAllPackageVersionsForPackageOwnedByOrg"]
-    }],
-    getAllPackageVersionsForAPackageOwnedByTheAuthenticatedUser: ["GET /user/packages/{package_type}/{package_name}/versions", {}, {
-      renamed: ["packages", "getAllPackageVersionsForPackageOwnedByAuthenticatedUser"]
-    }],
-    getAllPackageVersionsForPackageOwnedByAuthenticatedUser: ["GET /user/packages/{package_type}/{package_name}/versions"],
-    getAllPackageVersionsForPackageOwnedByOrg: ["GET /orgs/{org}/packages/{package_type}/{package_name}/versions"],
-    getAllPackageVersionsForPackageOwnedByUser: ["GET /users/{username}/packages/{package_type}/{package_name}/versions"],
-    getPackageForAuthenticatedUser: ["GET /user/packages/{package_type}/{package_name}"],
-    getPackageForOrganization: ["GET /orgs/{org}/packages/{package_type}/{package_name}"],
-    getPackageForUser: ["GET /users/{username}/packages/{package_type}/{package_name}"],
-    getPackageVersionForAuthenticatedUser: ["GET /user/packages/{package_type}/{package_name}/versions/{package_version_id}"],
-    getPackageVersionForOrganization: ["GET /orgs/{org}/packages/{package_type}/{package_name}/versions/{package_version_id}"],
-    getPackageVersionForUser: ["GET /users/{username}/packages/{package_type}/{package_name}/versions/{package_version_id}"],
-    listPackagesForAuthenticatedUser: ["GET /user/packages"],
-    listPackagesForOrganization: ["GET /orgs/{org}/packages"],
-    listPackagesForUser: ["GET /users/{username}/packages"],
-    restorePackageForAuthenticatedUser: ["POST /user/packages/{package_type}/{package_name}/restore{?token}"],
-    restorePackageForOrg: ["POST /orgs/{org}/packages/{package_type}/{package_name}/restore{?token}"],
-    restorePackageForUser: ["POST /users/{username}/packages/{package_type}/{package_name}/restore{?token}"],
-    restorePackageVersionForAuthenticatedUser: ["POST /user/packages/{package_type}/{package_name}/versions/{package_version_id}/restore"],
-    restorePackageVersionForOrg: ["POST /orgs/{org}/packages/{package_type}/{package_name}/versions/{package_version_id}/restore"],
-    restorePackageVersionForUser: ["POST /users/{username}/packages/{package_type}/{package_name}/versions/{package_version_id}/restore"]
-  },
-  projects: {
-    addCollaborator: ["PUT /projects/{project_id}/collaborators/{username}"],
-    createCard: ["POST /projects/columns/{column_id}/cards"],
-    createColumn: ["POST /projects/{project_id}/columns"],
-    createForAuthenticatedUser: ["POST /user/projects"],
-    createForOrg: ["POST /orgs/{org}/projects"],
-    createForRepo: ["POST /repos/{owner}/{repo}/projects"],
-    delete: ["DELETE /projects/{project_id}"],
-    deleteCard: ["DELETE /projects/columns/cards/{card_id}"],
-    deleteColumn: ["DELETE /projects/columns/{column_id}"],
-    get: ["GET /projects/{project_id}"],
-    getCard: ["GET /projects/columns/cards/{card_id}"],
-    getColumn: ["GET /projects/columns/{column_id}"],
-    getPermissionForUser: ["GET /projects/{project_id}/collaborators/{username}/permission"],
-    listCards: ["GET /projects/columns/{column_id}/cards"],
-    listCollaborators: ["GET /projects/{project_id}/collaborators"],
-    listColumns: ["GET /projects/{project_id}/columns"],
-    listForOrg: ["GET /orgs/{org}/projects"],
-    listForRepo: ["GET /repos/{owner}/{repo}/projects"],
-    listForUser: ["GET /users/{username}/projects"],
-    moveCard: ["POST /projects/columns/cards/{card_id}/moves"],
-    moveColumn: ["POST /projects/columns/{column_id}/moves"],
-    removeCollaborator: ["DELETE /projects/{project_id}/collaborators/{username}"],
-    update: ["PATCH /projects/{project_id}"],
-    updateCard: ["PATCH /projects/columns/cards/{card_id}"],
-    updateColumn: ["PATCH /projects/columns/{column_id}"]
-  },
-  pulls: {
-    checkIfMerged: ["GET /repos/{owner}/{repo}/pulls/{pull_number}/merge"],
-    create: ["POST /repos/{owner}/{repo}/pulls"],
-    createReplyForReviewComment: ["POST /repos/{owner}/{repo}/pulls/{pull_number}/comments/{comment_id}/replies"],
-    createReview: ["POST /repos/{owner}/{repo}/pulls/{pull_number}/reviews"],
-    createReviewComment: ["POST /repos/{owner}/{repo}/pulls/{pull_number}/comments"],
-    deletePendingReview: ["DELETE /repos/{owner}/{repo}/pulls/{pull_number}/reviews/{review_id}"],
-    deleteReviewComment: ["DELETE /repos/{owner}/{repo}/pulls/comments/{comment_id}"],
-    dismissReview: ["PUT /repos/{owner}/{repo}/pulls/{pull_number}/reviews/{review_id}/dismissals"],
-    get: ["GET /repos/{owner}/{repo}/pulls/{pull_number}"],
-    getReview: ["GET /repos/{owner}/{repo}/pulls/{pull_number}/reviews/{review_id}"],
-    getReviewComment: ["GET /repos/{owner}/{repo}/pulls/comments/{comment_id}"],
-    list: ["GET /repos/{owner}/{repo}/pulls"],
-    listCommentsForReview: ["GET /repos/{owner}/{repo}/pulls/{pull_number}/reviews/{review_id}/comments"],
-    listCommits: ["GET /repos/{owner}/{repo}/pulls/{pull_number}/commits"],
-    listFiles: ["GET /repos/{owner}/{repo}/pulls/{pull_number}/files"],
-    listRequestedReviewers: ["GET /repos/{owner}/{repo}/pulls/{pull_number}/requested_reviewers"],
-    listReviewComments: ["GET /repos/{owner}/{repo}/pulls/{pull_number}/comments"],
-    listReviewCommentsForRepo: ["GET /repos/{owner}/{repo}/pulls/comments"],
-    listReviews: ["GET /repos/{owner}/{repo}/pulls/{pull_number}/reviews"],
-    merge: ["PUT /repos/{owner}/{repo}/pulls/{pull_number}/merge"],
-    removeRequestedReviewers: ["DELETE /repos/{owner}/{repo}/pulls/{pull_number}/requested_reviewers"],
-    requestReviewers: ["POST /repos/{owner}/{repo}/pulls/{pull_number}/requested_reviewers"],
-    submitReview: ["POST /repos/{owner}/{repo}/pulls/{pull_number}/reviews/{review_id}/events"],
-    update: ["PATCH /repos/{owner}/{repo}/pulls/{pull_number}"],
-    updateBranch: ["PUT /repos/{owner}/{repo}/pulls/{pull_number}/update-branch"],
-    updateReview: ["PUT /repos/{owner}/{repo}/pulls/{pull_number}/reviews/{review_id}"],
-    updateReviewComment: ["PATCH /repos/{owner}/{repo}/pulls/comments/{comment_id}"]
-  },
-  rateLimit: {
-    get: ["GET /rate_limit"]
-  },
-  reactions: {
-    createForCommitComment: ["POST /repos/{owner}/{repo}/comments/{comment_id}/reactions"],
-    createForIssue: ["POST /repos/{owner}/{repo}/issues/{issue_number}/reactions"],
-    createForIssueComment: ["POST /repos/{owner}/{repo}/issues/comments/{comment_id}/reactions"],
-    createForPullRequestReviewComment: ["POST /repos/{owner}/{repo}/pulls/comments/{comment_id}/reactions"],
-    createForRelease: ["POST /repos/{owner}/{repo}/releases/{release_id}/reactions"],
-    createForTeamDiscussionCommentInOrg: ["POST /orgs/{org}/teams/{team_slug}/discussions/{discussion_number}/comments/{comment_number}/reactions"],
-    createForTeamDiscussionInOrg: ["POST /orgs/{org}/teams/{team_slug}/discussions/{discussion_number}/reactions"],
-    deleteForCommitComment: ["DELETE /repos/{owner}/{repo}/comments/{comment_id}/reactions/{reaction_id}"],
-    deleteForIssue: ["DELETE /repos/{owner}/{repo}/issues/{issue_number}/reactions/{reaction_id}"],
-    deleteForIssueComment: ["DELETE /repos/{owner}/{repo}/issues/comments/{comment_id}/reactions/{reaction_id}"],
-    deleteForPullRequestComment: ["DELETE /repos/{owner}/{repo}/pulls/comments/{comment_id}/reactions/{reaction_id}"],
-    deleteForRelease: ["DELETE /repos/{owner}/{repo}/releases/{release_id}/reactions/{reaction_id}"],
-    deleteForTeamDiscussion: ["DELETE /orgs/{org}/teams/{team_slug}/discussions/{discussion_number}/reactions/{reaction_id}"],
-    deleteForTeamDiscussionComment: ["DELETE /orgs/{org}/teams/{team_slug}/discussions/{discussion_number}/comments/{comment_number}/reactions/{reaction_id}"],
-    listForCommitComment: ["GET /repos/{owner}/{repo}/comments/{comment_id}/reactions"],
-    listForIssue: ["GET /repos/{owner}/{repo}/issues/{issue_number}/reactions"],
-    listForIssueComment: ["GET /repos/{owner}/{repo}/issues/comments/{comment_id}/reactions"],
-    listForPullRequestReviewComment: ["GET /repos/{owner}/{repo}/pulls/comments/{comment_id}/reactions"],
-    listForRelease: ["GET /repos/{owner}/{repo}/releases/{release_id}/reactions"],
-    listForTeamDiscussionCommentInOrg: ["GET /orgs/{org}/teams/{team_slug}/discussions/{discussion_number}/comments/{comment_number}/reactions"],
-    listForTeamDiscussionInOrg: ["GET /orgs/{org}/teams/{team_slug}/discussions/{discussion_number}/reactions"]
-  },
-  repos: {
-    acceptInvitation: ["PATCH /user/repository_invitations/{invitation_id}", {}, {
-      renamed: ["repos", "acceptInvitationForAuthenticatedUser"]
-    }],
-    acceptInvitationForAuthenticatedUser: ["PATCH /user/repository_invitations/{invitation_id}"],
-    addAppAccessRestrictions: ["POST /repos/{owner}/{repo}/branches/{branch}/protection/restrictions/apps", {}, {
-      mapToData: "apps"
-    }],
-    addCollaborator: ["PUT /repos/{owner}/{repo}/collaborators/{username}"],
-    addStatusCheckContexts: ["POST /repos/{owner}/{repo}/branches/{branch}/protection/required_status_checks/contexts", {}, {
-      mapToData: "contexts"
-    }],
-    addTeamAccessRestrictions: ["POST /repos/{owner}/{repo}/branches/{branch}/protection/restrictions/teams", {}, {
-      mapToData: "teams"
-    }],
-    addUserAccessRestrictions: ["POST /repos/{owner}/{repo}/branches/{branch}/protection/restrictions/users", {}, {
-      mapToData: "users"
-    }],
-    checkCollaborator: ["GET /repos/{owner}/{repo}/collaborators/{username}"],
-    checkVulnerabilityAlerts: ["GET /repos/{owner}/{repo}/vulnerability-alerts"],
-    codeownersErrors: ["GET /repos/{owner}/{repo}/codeowners/errors"],
-    compareCommits: ["GET /repos/{owner}/{repo}/compare/{base}...{head}"],
-    compareCommitsWithBasehead: ["GET /repos/{owner}/{repo}/compare/{basehead}"],
-    createAutolink: ["POST /repos/{owner}/{repo}/autolinks"],
-    createCommitComment: ["POST /repos/{owner}/{repo}/commits/{commit_sha}/comments"],
-    createCommitSignatureProtection: ["POST /repos/{owner}/{repo}/branches/{branch}/protection/required_signatures"],
-    createCommitStatus: ["POST /repos/{owner}/{repo}/statuses/{sha}"],
-    createDeployKey: ["POST /repos/{owner}/{repo}/keys"],
-    createDeployment: ["POST /repos/{owner}/{repo}/deployments"],
-    createDeploymentBranchPolicy: ["POST /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies"],
-    createDeploymentStatus: ["POST /repos/{owner}/{repo}/deployments/{deployment_id}/statuses"],
-    createDispatchEvent: ["POST /repos/{owner}/{repo}/dispatches"],
-    createForAuthenticatedUser: ["POST /user/repos"],
-    createFork: ["POST /repos/{owner}/{repo}/forks"],
-    createInOrg: ["POST /orgs/{org}/repos"],
-    createOrUpdateEnvironment: ["PUT /repos/{owner}/{repo}/environments/{environment_name}"],
-    createOrUpdateFileContents: ["PUT /repos/{owner}/{repo}/contents/{path}"],
-    createPagesDeployment: ["POST /repos/{owner}/{repo}/pages/deployment"],
-    createPagesSite: ["POST /repos/{owner}/{repo}/pages"],
-    createRelease: ["POST /repos/{owner}/{repo}/releases"],
-    createTagProtection: ["POST /repos/{owner}/{repo}/tags/protection"],
-    createUsingTemplate: ["POST /repos/{template_owner}/{template_repo}/generate"],
-    createWebhook: ["POST /repos/{owner}/{repo}/hooks"],
-    declineInvitation: ["DELETE /user/repository_invitations/{invitation_id}", {}, {
-      renamed: ["repos", "declineInvitationForAuthenticatedUser"]
-    }],
-    declineInvitationForAuthenticatedUser: ["DELETE /user/repository_invitations/{invitation_id}"],
-    delete: ["DELETE /repos/{owner}/{repo}"],
-    deleteAccessRestrictions: ["DELETE /repos/{owner}/{repo}/branches/{branch}/protection/restrictions"],
-    deleteAdminBranchProtection: ["DELETE /repos/{owner}/{repo}/branches/{branch}/protection/enforce_admins"],
-    deleteAnEnvironment: ["DELETE /repos/{owner}/{repo}/environments/{environment_name}"],
-    deleteAutolink: ["DELETE /repos/{owner}/{repo}/autolinks/{autolink_id}"],
-    deleteBranchProtection: ["DELETE /repos/{owner}/{repo}/branches/{branch}/protection"],
-    deleteCommitComment: ["DELETE /repos/{owner}/{repo}/comments/{comment_id}"],
-    deleteCommitSignatureProtection: ["DELETE /repos/{owner}/{repo}/branches/{branch}/protection/required_signatures"],
-    deleteDeployKey: ["DELETE /repos/{owner}/{repo}/keys/{key_id}"],
-    deleteDeployment: ["DELETE /repos/{owner}/{repo}/deployments/{deployment_id}"],
-    deleteDeploymentBranchPolicy: ["DELETE /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies/{branch_policy_id}"],
-    deleteFile: ["DELETE /repos/{owner}/{repo}/contents/{path}"],
-    deleteInvitation: ["DELETE /repos/{owner}/{repo}/invitations/{invitation_id}"],
-    deletePagesSite: ["DELETE /repos/{owner}/{repo}/pages"],
-    deletePullRequestReviewProtection: ["DELETE /repos/{owner}/{repo}/branches/{branch}/protection/required_pull_request_reviews"],
-    deleteRelease: ["DELETE /repos/{owner}/{repo}/releases/{release_id}"],
-    deleteReleaseAsset: ["DELETE /repos/{owner}/{repo}/releases/assets/{asset_id}"],
-    deleteTagProtection: ["DELETE /repos/{owner}/{repo}/tags/protection/{tag_protection_id}"],
-    deleteWebhook: ["DELETE /repos/{owner}/{repo}/hooks/{hook_id}"],
-    disableAutomatedSecurityFixes: ["DELETE /repos/{owner}/{repo}/automated-security-fixes"],
-    disableLfsForRepo: ["DELETE /repos/{owner}/{repo}/lfs"],
-    disableVulnerabilityAlerts: ["DELETE /repos/{owner}/{repo}/vulnerability-alerts"],
-    downloadArchive: ["GET /repos/{owner}/{repo}/zipball/{ref}", {}, {
-      renamed: ["repos", "downloadZipballArchive"]
-    }],
-    downloadTarballArchive: ["GET /repos/{owner}/{repo}/tarball/{ref}"],
-    downloadZipballArchive: ["GET /repos/{owner}/{repo}/zipball/{ref}"],
-    enableAutomatedSecurityFixes: ["PUT /repos/{owner}/{repo}/automated-security-fixes"],
-    enableLfsForRepo: ["PUT /repos/{owner}/{repo}/lfs"],
-    enableVulnerabilityAlerts: ["PUT /repos/{owner}/{repo}/vulnerability-alerts"],
-    generateReleaseNotes: ["POST /repos/{owner}/{repo}/releases/generate-notes"],
-    get: ["GET /repos/{owner}/{repo}"],
-    getAccessRestrictions: ["GET /repos/{owner}/{repo}/branches/{branch}/protection/restrictions"],
-    getAdminBranchProtection: ["GET /repos/{owner}/{repo}/branches/{branch}/protection/enforce_admins"],
-    getAllEnvironments: ["GET /repos/{owner}/{repo}/environments"],
-    getAllStatusCheckContexts: ["GET /repos/{owner}/{repo}/branches/{branch}/protection/required_status_checks/contexts"],
-    getAllTopics: ["GET /repos/{owner}/{repo}/topics"],
-    getAppsWithAccessToProtectedBranch: ["GET /repos/{owner}/{repo}/branches/{branch}/protection/restrictions/apps"],
-    getAutolink: ["GET /repos/{owner}/{repo}/autolinks/{autolink_id}"],
-    getBranch: ["GET /repos/{owner}/{repo}/branches/{branch}"],
-    getBranchProtection: ["GET /repos/{owner}/{repo}/branches/{branch}/protection"],
-    getClones: ["GET /repos/{owner}/{repo}/traffic/clones"],
-    getCodeFrequencyStats: ["GET /repos/{owner}/{repo}/stats/code_frequency"],
-    getCollaboratorPermissionLevel: ["GET /repos/{owner}/{repo}/collaborators/{username}/permission"],
-    getCombinedStatusForRef: ["GET /repos/{owner}/{repo}/commits/{ref}/status"],
-    getCommit: ["GET /repos/{owner}/{repo}/commits/{ref}"],
-    getCommitActivityStats: ["GET /repos/{owner}/{repo}/stats/commit_activity"],
-    getCommitComment: ["GET /repos/{owner}/{repo}/comments/{comment_id}"],
-    getCommitSignatureProtection: ["GET /repos/{owner}/{repo}/branches/{branch}/protection/required_signatures"],
-    getCommunityProfileMetrics: ["GET /repos/{owner}/{repo}/community/profile"],
-    getContent: ["GET /repos/{owner}/{repo}/contents/{path}"],
-    getContributorsStats: ["GET /repos/{owner}/{repo}/stats/contributors"],
-    getDeployKey: ["GET /repos/{owner}/{repo}/keys/{key_id}"],
-    getDeployment: ["GET /repos/{owner}/{repo}/deployments/{deployment_id}"],
-    getDeploymentBranchPolicy: ["GET /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies/{branch_policy_id}"],
-    getDeploymentStatus: ["GET /repos/{owner}/{repo}/deployments/{deployment_id}/statuses/{status_id}"],
-    getEnvironment: ["GET /repos/{owner}/{repo}/environments/{environment_name}"],
-    getLatestPagesBuild: ["GET /repos/{owner}/{repo}/pages/builds/latest"],
-    getLatestRelease: ["GET /repos/{owner}/{repo}/releases/latest"],
-    getPages: ["GET /repos/{owner}/{repo}/pages"],
-    getPagesBuild: ["GET /repos/{owner}/{repo}/pages/builds/{build_id}"],
-    getPagesHealthCheck: ["GET /repos/{owner}/{repo}/pages/health"],
-    getParticipationStats: ["GET /repos/{owner}/{repo}/stats/participation"],
-    getPullRequestReviewProtection: ["GET /repos/{owner}/{repo}/branches/{branch}/protection/required_pull_request_reviews"],
-    getPunchCardStats: ["GET /repos/{owner}/{repo}/stats/punch_card"],
-    getReadme: ["GET /repos/{owner}/{repo}/readme"],
-    getReadmeInDirectory: ["GET /repos/{owner}/{repo}/readme/{dir}"],
-    getRelease: ["GET /repos/{owner}/{repo}/releases/{release_id}"],
-    getReleaseAsset: ["GET /repos/{owner}/{repo}/releases/assets/{asset_id}"],
-    getReleaseByTag: ["GET /repos/{owner}/{repo}/releases/tags/{tag}"],
-    getStatusChecksProtection: ["GET /repos/{owner}/{repo}/branches/{branch}/protection/required_status_checks"],
-    getTeamsWithAccessToProtectedBranch: ["GET /repos/{owner}/{repo}/branches/{branch}/protection/restrictions/teams"],
-    getTopPaths: ["GET /repos/{owner}/{repo}/traffic/popular/paths"],
-    getTopReferrers: ["GET /repos/{owner}/{repo}/traffic/popular/referrers"],
-    getUsersWithAccessToProtectedBranch: ["GET /repos/{owner}/{repo}/branches/{branch}/protection/restrictions/users"],
-    getViews: ["GET /repos/{owner}/{repo}/traffic/views"],
-    getWebhook: ["GET /repos/{owner}/{repo}/hooks/{hook_id}"],
-    getWebhookConfigForRepo: ["GET /repos/{owner}/{repo}/hooks/{hook_id}/config"],
-    getWebhookDelivery: ["GET /repos/{owner}/{repo}/hooks/{hook_id}/deliveries/{delivery_id}"],
-    listAutolinks: ["GET /repos/{owner}/{repo}/autolinks"],
-    listBranches: ["GET /repos/{owner}/{repo}/branches"],
-    listBranchesForHeadCommit: ["GET /repos/{owner}/{repo}/commits/{commit_sha}/branches-where-head"],
-    listCollaborators: ["GET /repos/{owner}/{repo}/collaborators"],
-    listCommentsForCommit: ["GET /repos/{owner}/{repo}/commits/{commit_sha}/comments"],
-    listCommitCommentsForRepo: ["GET /repos/{owner}/{repo}/comments"],
-    listCommitStatusesForRef: ["GET /repos/{owner}/{repo}/commits/{ref}/statuses"],
-    listCommits: ["GET /repos/{owner}/{repo}/commits"],
-    listContributors: ["GET /repos/{owner}/{repo}/contributors"],
-    listDeployKeys: ["GET /repos/{owner}/{repo}/keys"],
-    listDeploymentBranchPolicies: ["GET /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies"],
-    listDeploymentStatuses: ["GET /repos/{owner}/{repo}/deployments/{deployment_id}/statuses"],
-    listDeployments: ["GET /repos/{owner}/{repo}/deployments"],
-    listForAuthenticatedUser: ["GET /user/repos"],
-    listForOrg: ["GET /orgs/{org}/repos"],
-    listForUser: ["GET /users/{username}/repos"],
-    listForks: ["GET /repos/{owner}/{repo}/forks"],
-    listInvitations: ["GET /repos/{owner}/{repo}/invitations"],
-    listInvitationsForAuthenticatedUser: ["GET /user/repository_invitations"],
-    listLanguages: ["GET /repos/{owner}/{repo}/languages"],
-    listPagesBuilds: ["GET /repos/{owner}/{repo}/pages/builds"],
-    listPublic: ["GET /repositories"],
-    listPullRequestsAssociatedWithCommit: ["GET /repos/{owner}/{repo}/commits/{commit_sha}/pulls"],
-    listReleaseAssets: ["GET /repos/{owner}/{repo}/releases/{release_id}/assets"],
-    listReleases: ["GET /repos/{owner}/{repo}/releases"],
-    listTagProtection: ["GET /repos/{owner}/{repo}/tags/protection"],
-    listTags: ["GET /repos/{owner}/{repo}/tags"],
-    listTeams: ["GET /repos/{owner}/{repo}/teams"],
-    listWebhookDeliveries: ["GET /repos/{owner}/{repo}/hooks/{hook_id}/deliveries"],
-    listWebhooks: ["GET /repos/{owner}/{repo}/hooks"],
-    merge: ["POST /repos/{owner}/{repo}/merges"],
-    mergeUpstream: ["POST /repos/{owner}/{repo}/merge-upstream"],
-    pingWebhook: ["POST /repos/{owner}/{repo}/hooks/{hook_id}/pings"],
-    redeliverWebhookDelivery: ["POST /repos/{owner}/{repo}/hooks/{hook_id}/deliveries/{delivery_id}/attempts"],
-    removeAppAccessRestrictions: ["DELETE /repos/{owner}/{repo}/branches/{branch}/protection/restrictions/apps", {}, {
-      mapToData: "apps"
-    }],
-    removeCollaborator: ["DELETE /repos/{owner}/{repo}/collaborators/{username}"],
-    removeStatusCheckContexts: ["DELETE /repos/{owner}/{repo}/branches/{branch}/protection/required_status_checks/contexts", {}, {
-      mapToData: "contexts"
-    }],
-    removeStatusCheckProtection: ["DELETE /repos/{owner}/{repo}/branches/{branch}/protection/required_status_checks"],
-    removeTeamAccessRestrictions: ["DELETE /repos/{owner}/{repo}/branches/{branch}/protection/restrictions/teams", {}, {
-      mapToData: "teams"
-    }],
-    removeUserAccessRestrictions: ["DELETE /repos/{owner}/{repo}/branches/{branch}/protection/restrictions/users", {}, {
-      mapToData: "users"
-    }],
-    renameBranch: ["POST /repos/{owner}/{repo}/branches/{branch}/rename"],
-    replaceAllTopics: ["PUT /repos/{owner}/{repo}/topics"],
-    requestPagesBuild: ["POST /repos/{owner}/{repo}/pages/builds"],
-    setAdminBranchProtection: ["POST /repos/{owner}/{repo}/branches/{branch}/protection/enforce_admins"],
-    setAppAccessRestrictions: ["PUT /repos/{owner}/{repo}/branches/{branch}/protection/restrictions/apps", {}, {
-      mapToData: "apps"
-    }],
-    setStatusCheckContexts: ["PUT /repos/{owner}/{repo}/branches/{branch}/protection/required_status_checks/contexts", {}, {
-      mapToData: "contexts"
-    }],
-    setTeamAccessRestrictions: ["PUT /repos/{owner}/{repo}/branches/{branch}/protection/restrictions/teams", {}, {
-      mapToData: "teams"
-    }],
-    setUserAccessRestrictions: ["PUT /repos/{owner}/{repo}/branches/{branch}/protection/restrictions/users", {}, {
-      mapToData: "users"
-    }],
-    testPushWebhook: ["POST /repos/{owner}/{repo}/hooks/{hook_id}/tests"],
-    transfer: ["POST /repos/{owner}/{repo}/transfer"],
-    update: ["PATCH /repos/{owner}/{repo}"],
-    updateBranchProtection: ["PUT /repos/{owner}/{repo}/branches/{branch}/protection"],
-    updateCommitComment: ["PATCH /repos/{owner}/{repo}/comments/{comment_id}"],
-    updateDeploymentBranchPolicy: ["PUT /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies/{branch_policy_id}"],
-    updateInformationAboutPagesSite: ["PUT /repos/{owner}/{repo}/pages"],
-    updateInvitation: ["PATCH /repos/{owner}/{repo}/invitations/{invitation_id}"],
-    updatePullRequestReviewProtection: ["PATCH /repos/{owner}/{repo}/branches/{branch}/protection/required_pull_request_reviews"],
-    updateRelease: ["PATCH /repos/{owner}/{repo}/releases/{release_id}"],
-    updateReleaseAsset: ["PATCH /repos/{owner}/{repo}/releases/assets/{asset_id}"],
-    updateStatusCheckPotection: ["PATCH /repos/{owner}/{repo}/branches/{branch}/protection/required_status_checks", {}, {
-      renamed: ["repos", "updateStatusCheckProtection"]
-    }],
-    updateStatusCheckProtection: ["PATCH /repos/{owner}/{repo}/branches/{branch}/protection/required_status_checks"],
-    updateWebhook: ["PATCH /repos/{owner}/{repo}/hooks/{hook_id}"],
-    updateWebhookConfigForRepo: ["PATCH /repos/{owner}/{repo}/hooks/{hook_id}/config"],
-    uploadReleaseAsset: ["POST /repos/{owner}/{repo}/releases/{release_id}/assets{?name,label}", {
-      baseUrl: "https://uploads.github.com"
-    }]
-  },
-  search: {
-    code: ["GET /search/code"],
-    commits: ["GET /search/commits"],
-    issuesAndPullRequests: ["GET /search/issues"],
-    labels: ["GET /search/labels"],
-    repos: ["GET /search/repositories"],
-    topics: ["GET /search/topics"],
-    users: ["GET /search/users"]
-  },
-  secretScanning: {
-    getAlert: ["GET /repos/{owner}/{repo}/secret-scanning/alerts/{alert_number}"],
-    getSecurityAnalysisSettingsForEnterprise: ["GET /enterprises/{enterprise}/code_security_and_analysis"],
-    listAlertsForEnterprise: ["GET /enterprises/{enterprise}/secret-scanning/alerts"],
-    listAlertsForOrg: ["GET /orgs/{org}/secret-scanning/alerts"],
-    listAlertsForRepo: ["GET /repos/{owner}/{repo}/secret-scanning/alerts"],
-    listLocationsForAlert: ["GET /repos/{owner}/{repo}/secret-scanning/alerts/{alert_number}/locations"],
-    patchSecurityAnalysisSettingsForEnterprise: ["PATCH /enterprises/{enterprise}/code_security_and_analysis"],
-    postSecurityProductEnablementForEnterprise: ["POST /enterprises/{enterprise}/{security_product}/{enablement}"],
-    updateAlert: ["PATCH /repos/{owner}/{repo}/secret-scanning/alerts/{alert_number}"]
-  },
-  teams: {
-    addOrUpdateMembershipForUserInOrg: ["PUT /orgs/{org}/teams/{team_slug}/memberships/{username}"],
-    addOrUpdateProjectPermissionsInOrg: ["PUT /orgs/{org}/teams/{team_slug}/projects/{project_id}"],
-    addOrUpdateRepoPermissionsInOrg: ["PUT /orgs/{org}/teams/{team_slug}/repos/{owner}/{repo}"],
-    checkPermissionsForProjectInOrg: ["GET /orgs/{org}/teams/{team_slug}/projects/{project_id}"],
-    checkPermissionsForRepoInOrg: ["GET /orgs/{org}/teams/{team_slug}/repos/{owner}/{repo}"],
-    create: ["POST /orgs/{org}/teams"],
-    createDiscussionCommentInOrg: ["POST /orgs/{org}/teams/{team_slug}/discussions/{discussion_number}/comments"],
-    createDiscussionInOrg: ["POST /orgs/{org}/teams/{team_slug}/discussions"],
-    deleteDiscussionCommentInOrg: ["DELETE /orgs/{org}/teams/{team_slug}/discussions/{discussion_number}/comments/{comment_number}"],
-    deleteDiscussionInOrg: ["DELETE /orgs/{org}/teams/{team_slug}/discussions/{discussion_number}"],
-    deleteInOrg: ["DELETE /orgs/{org}/teams/{team_slug}"],
-    getByName: ["GET /orgs/{org}/teams/{team_slug}"],
-    getDiscussionCommentInOrg: ["GET /orgs/{org}/teams/{team_slug}/discussions/{discussion_number}/comments/{comment_number}"],
-    getDiscussionInOrg: ["GET /orgs/{org}/teams/{team_slug}/discussions/{discussion_number}"],
-    getMembershipForUserInOrg: ["GET /orgs/{org}/teams/{team_slug}/memberships/{username}"],
-    list: ["GET /orgs/{org}/teams"],
-    listChildInOrg: ["GET /orgs/{org}/teams/{team_slug}/teams"],
-    listDiscussionCommentsInOrg: ["GET /orgs/{org}/teams/{team_slug}/discussions/{discussion_number}/comments"],
-    listDiscussionsInOrg: ["GET /orgs/{org}/teams/{team_slug}/discussions"],
-    listForAuthenticatedUser: ["GET /user/teams"],
-    listMembersInOrg: ["GET /orgs/{org}/teams/{team_slug}/members"],
-    listPendingInvitationsInOrg: ["GET /orgs/{org}/teams/{team_slug}/invitations"],
-    listProjectsInOrg: ["GET /orgs/{org}/teams/{team_slug}/projects"],
-    listReposInOrg: ["GET /orgs/{org}/teams/{team_slug}/repos"],
-    removeMembershipForUserInOrg: ["DELETE /orgs/{org}/teams/{team_slug}/memberships/{username}"],
-    removeProjectInOrg: ["DELETE /orgs/{org}/teams/{team_slug}/projects/{project_id}"],
-    removeRepoInOrg: ["DELETE /orgs/{org}/teams/{team_slug}/repos/{owner}/{repo}"],
-    updateDiscussionCommentInOrg: ["PATCH /orgs/{org}/teams/{team_slug}/discussions/{discussion_number}/comments/{comment_number}"],
-    updateDiscussionInOrg: ["PATCH /orgs/{org}/teams/{team_slug}/discussions/{discussion_number}"],
-    updateInOrg: ["PATCH /orgs/{org}/teams/{team_slug}"]
-  },
-  users: {
-    addEmailForAuthenticated: ["POST /user/emails", {}, {
-      renamed: ["users", "addEmailForAuthenticatedUser"]
-    }],
-    addEmailForAuthenticatedUser: ["POST /user/emails"],
-    block: ["PUT /user/blocks/{username}"],
-    checkBlocked: ["GET /user/blocks/{username}"],
-    checkFollowingForUser: ["GET /users/{username}/following/{target_user}"],
-    checkPersonIsFollowedByAuthenticated: ["GET /user/following/{username}"],
-    createGpgKeyForAuthenticated: ["POST /user/gpg_keys", {}, {
-      renamed: ["users", "createGpgKeyForAuthenticatedUser"]
-    }],
-    createGpgKeyForAuthenticatedUser: ["POST /user/gpg_keys"],
-    createPublicSshKeyForAuthenticated: ["POST /user/keys", {}, {
-      renamed: ["users", "createPublicSshKeyForAuthenticatedUser"]
-    }],
-    createPublicSshKeyForAuthenticatedUser: ["POST /user/keys"],
-    createSshSigningKeyForAuthenticatedUser: ["POST /user/ssh_signing_keys"],
-    deleteEmailForAuthenticated: ["DELETE /user/emails", {}, {
-      renamed: ["users", "deleteEmailForAuthenticatedUser"]
-    }],
-    deleteEmailForAuthenticatedUser: ["DELETE /user/emails"],
-    deleteGpgKeyForAuthenticated: ["DELETE /user/gpg_keys/{gpg_key_id}", {}, {
-      renamed: ["users", "deleteGpgKeyForAuthenticatedUser"]
-    }],
-    deleteGpgKeyForAuthenticatedUser: ["DELETE /user/gpg_keys/{gpg_key_id}"],
-    deletePublicSshKeyForAuthenticated: ["DELETE /user/keys/{key_id}", {}, {
-      renamed: ["users", "deletePublicSshKeyForAuthenticatedUser"]
-    }],
-    deletePublicSshKeyForAuthenticatedUser: ["DELETE /user/keys/{key_id}"],
-    deleteSshSigningKeyForAuthenticatedUser: ["DELETE /user/ssh_signing_keys/{ssh_signing_key_id}"],
-    follow: ["PUT /user/following/{username}"],
-    getAuthenticated: ["GET /user"],
-    getByUsername: ["GET /users/{username}"],
-    getContextForUser: ["GET /users/{username}/hovercard"],
-    getGpgKeyForAuthenticated: ["GET /user/gpg_keys/{gpg_key_id}", {}, {
-      renamed: ["users", "getGpgKeyForAuthenticatedUser"]
-    }],
-    getGpgKeyForAuthenticatedUser: ["GET /user/gpg_keys/{gpg_key_id}"],
-    getPublicSshKeyForAuthenticated: ["GET /user/keys/{key_id}", {}, {
-      renamed: ["users", "getPublicSshKeyForAuthenticatedUser"]
-    }],
-    getPublicSshKeyForAuthenticatedUser: ["GET /user/keys/{key_id}"],
-    getSshSigningKeyForAuthenticatedUser: ["GET /user/ssh_signing_keys/{ssh_signing_key_id}"],
-    list: ["GET /users"],
-    listBlockedByAuthenticated: ["GET /user/blocks", {}, {
-      renamed: ["users", "listBlockedByAuthenticatedUser"]
-    }],
-    listBlockedByAuthenticatedUser: ["GET /user/blocks"],
-    listEmailsForAuthenticated: ["GET /user/emails", {}, {
-      renamed: ["users", "listEmailsForAuthenticatedUser"]
-    }],
-    listEmailsForAuthenticatedUser: ["GET /user/emails"],
-    listFollowedByAuthenticated: ["GET /user/following", {}, {
-      renamed: ["users", "listFollowedByAuthenticatedUser"]
-    }],
-    listFollowedByAuthenticatedUser: ["GET /user/following"],
-    listFollowersForAuthenticatedUser: ["GET /user/followers"],
-    listFollowersForUser: ["GET /users/{username}/followers"],
-    listFollowingForUser: ["GET /users/{username}/following"],
-    listGpgKeysForAuthenticated: ["GET /user/gpg_keys", {}, {
-      renamed: ["users", "listGpgKeysForAuthenticatedUser"]
-    }],
-    listGpgKeysForAuthenticatedUser: ["GET /user/gpg_keys"],
-    listGpgKeysForUser: ["GET /users/{username}/gpg_keys"],
-    listPublicEmailsForAuthenticated: ["GET /user/public_emails", {}, {
-      renamed: ["users", "listPublicEmailsForAuthenticatedUser"]
-    }],
-    listPublicEmailsForAuthenticatedUser: ["GET /user/public_emails"],
-    listPublicKeysForUser: ["GET /users/{username}/keys"],
-    listPublicSshKeysForAuthenticated: ["GET /user/keys", {}, {
-      renamed: ["users", "listPublicSshKeysForAuthenticatedUser"]
-    }],
-    listPublicSshKeysForAuthenticatedUser: ["GET /user/keys"],
-    listSshSigningKeysForAuthenticatedUser: ["GET /user/ssh_signing_keys"],
-    listSshSigningKeysForUser: ["GET /users/{username}/ssh_signing_keys"],
-    setPrimaryEmailVisibilityForAuthenticated: ["PATCH /user/email/visibility", {}, {
-      renamed: ["users", "setPrimaryEmailVisibilityForAuthenticatedUser"]
-    }],
-    setPrimaryEmailVisibilityForAuthenticatedUser: ["PATCH /user/email/visibility"],
-    unblock: ["DELETE /user/blocks/{username}"],
-    unfollow: ["DELETE /user/following/{username}"],
-    updateAuthenticated: ["PATCH /user"]
-  }
-};
-
-const VERSION = "7.0.1";
-
-function endpointsToMethods(octokit, endpointsMap) {
-  const newMethods = {};
-  for (const [scope, endpoints] of Object.entries(endpointsMap)) {
-    for (const [methodName, endpoint] of Object.entries(endpoints)) {
-      const [route, defaults, decorations] = endpoint;
-      const [method, url] = route.split(/ /);
-      const endpointDefaults = Object.assign({
-        method,
-        url
-      }, defaults);
-      if (!newMethods[scope]) {
-        newMethods[scope] = {};
-      }
-      const scopeMethods = newMethods[scope];
-      if (decorations) {
-        scopeMethods[methodName] = decorate(octokit, scope, methodName, endpointDefaults, decorations);
-        continue;
-      }
-      scopeMethods[methodName] = octokit.request.defaults(endpointDefaults);
-    }
-  }
-  return newMethods;
-}
-function decorate(octokit, scope, methodName, defaults, decorations) {
-  const requestWithDefaults = octokit.request.defaults(defaults);
-  /* istanbul ignore next */
-  function withDecorations(...args) {
-    // @ts-ignore https://github.com/microsoft/TypeScript/issues/25488
-    let options = requestWithDefaults.endpoint.merge(...args);
-    // There are currently no other decorations than `.mapToData`
-    if (decorations.mapToData) {
-      options = Object.assign({}, options, {
-        data: options[decorations.mapToData],
-        [decorations.mapToData]: undefined
-      });
-      return requestWithDefaults(options);
-    }
-    if (decorations.renamed) {
-      const [newScope, newMethodName] = decorations.renamed;
-      octokit.log.warn(`octokit.${scope}.${methodName}() has been renamed to octokit.${newScope}.${newMethodName}()`);
-    }
-    if (decorations.deprecated) {
-      octokit.log.warn(decorations.deprecated);
-    }
-    if (decorations.renamedParameters) {
-      // @ts-ignore https://github.com/microsoft/TypeScript/issues/25488
-      const options = requestWithDefaults.endpoint.merge(...args);
-      for (const [name, alias] of Object.entries(decorations.renamedParameters)) {
-        if (name in options) {
-          octokit.log.warn(`"${name}" parameter is deprecated for "octokit.${scope}.${methodName}()". Use "${alias}" instead`);
-          if (!(alias in options)) {
-            options[alias] = options[name];
-          }
-          delete options[name];
-        }
-      }
-      return requestWithDefaults(options);
-    }
-    // @ts-ignore https://github.com/microsoft/TypeScript/issues/25488
-    return requestWithDefaults(...args);
-  }
-  return Object.assign(withDecorations, requestWithDefaults);
-}
-
-function restEndpointMethods(octokit) {
-  const api = endpointsToMethods(octokit, Endpoints);
-  return {
-    rest: api
-  };
-}
-restEndpointMethods.VERSION = VERSION;
-function legacyRestEndpointMethods(octokit) {
-  const api = endpointsToMethods(octokit, Endpoints);
-  return {
-    ...api,
-    rest: api
-  };
-}
-legacyRestEndpointMethods.VERSION = VERSION;
-
-exports.legacyRestEndpointMethods = legacyRestEndpointMethods;
-exports.restEndpointMethods = restEndpointMethods;
-//# sourceMappingURL=index.js.map
-
-
-/***/ }),
-
-/***/ 537:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-
-function _interopDefault (ex) { return (ex && (typeof ex === 'object') && 'default' in ex) ? ex['default'] : ex; }
-
-var deprecation = __nccwpck_require__(8932);
-var once = _interopDefault(__nccwpck_require__(1223));
-
-const logOnceCode = once(deprecation => console.warn(deprecation));
-const logOnceHeaders = once(deprecation => console.warn(deprecation));
-/**
- * Error with extra properties to help with debugging
- */
-class RequestError extends Error {
-  constructor(message, statusCode, options) {
-    super(message);
-    // Maintains proper stack trace (only available on V8)
-    /* istanbul ignore next */
-    if (Error.captureStackTrace) {
-      Error.captureStackTrace(this, this.constructor);
-    }
-    this.name = "HttpError";
-    this.status = statusCode;
-    let headers;
-    if ("headers" in options && typeof options.headers !== "undefined") {
-      headers = options.headers;
-    }
-    if ("response" in options) {
-      this.response = options.response;
-      headers = options.response.headers;
-    }
-    // redact request credentials without mutating original request options
-    const requestCopy = Object.assign({}, options.request);
-    if (options.request.headers.authorization) {
-      requestCopy.headers = Object.assign({}, options.request.headers, {
-        authorization: options.request.headers.authorization.replace(/ .*$/, " [REDACTED]")
-      });
-    }
-    requestCopy.url = requestCopy.url
-    // client_id & client_secret can be passed as URL query parameters to increase rate limit
-    // see https://developer.github.com/v3/#increasing-the-unauthenticated-rate-limit-for-oauth-applications
-    .replace(/\bclient_secret=\w+/g, "client_secret=[REDACTED]")
-    // OAuth tokens can be passed as URL query parameters, although it is not recommended
-    // see https://developer.github.com/v3/#oauth2-token-sent-in-a-header
-    .replace(/\baccess_token=\w+/g, "access_token=[REDACTED]");
-    this.request = requestCopy;
-    // deprecations
-    Object.defineProperty(this, "code", {
-      get() {
-        logOnceCode(new deprecation.Deprecation("[@octokit/request-error] `error.code` is deprecated, use `error.status`."));
-        return statusCode;
-      }
-    });
-    Object.defineProperty(this, "headers", {
-      get() {
-        logOnceHeaders(new deprecation.Deprecation("[@octokit/request-error] `error.headers` is deprecated, use `error.response.headers`."));
-        return headers || {};
-      }
-    });
-  }
-}
-
-exports.RequestError = RequestError;
-//# sourceMappingURL=index.js.map
-
-
-/***/ }),
-
-/***/ 6234:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-
-function _interopDefault (ex) { return (ex && (typeof ex === 'object') && 'default' in ex) ? ex['default'] : ex; }
-
-var endpoint = __nccwpck_require__(9440);
-var universalUserAgent = __nccwpck_require__(5030);
-var isPlainObject = __nccwpck_require__(3287);
-var nodeFetch = _interopDefault(__nccwpck_require__(467));
-var requestError = __nccwpck_require__(537);
-
-const VERSION = "6.2.3";
-
-function getBufferResponse(response) {
-  return response.arrayBuffer();
-}
-
-function fetchWrapper(requestOptions) {
-  const log = requestOptions.request && requestOptions.request.log ? requestOptions.request.log : console;
-  if (isPlainObject.isPlainObject(requestOptions.body) || Array.isArray(requestOptions.body)) {
-    requestOptions.body = JSON.stringify(requestOptions.body);
-  }
-  let headers = {};
-  let status;
-  let url;
-  const fetch = requestOptions.request && requestOptions.request.fetch || globalThis.fetch || /* istanbul ignore next */nodeFetch;
-  return fetch(requestOptions.url, Object.assign({
-    method: requestOptions.method,
-    body: requestOptions.body,
-    headers: requestOptions.headers,
-    redirect: requestOptions.redirect
-  },
-  // `requestOptions.request.agent` type is incompatible
-  // see https://github.com/octokit/types.ts/pull/264
-  requestOptions.request)).then(async response => {
-    url = response.url;
-    status = response.status;
-    for (const keyAndValue of response.headers) {
-      headers[keyAndValue[0]] = keyAndValue[1];
-    }
-    if ("deprecation" in headers) {
-      const matches = headers.link && headers.link.match(/<([^>]+)>; rel="deprecation"/);
-      const deprecationLink = matches && matches.pop();
-      log.warn(`[@octokit/request] "${requestOptions.method} ${requestOptions.url}" is deprecated. It is scheduled to be removed on ${headers.sunset}${deprecationLink ? `. See ${deprecationLink}` : ""}`);
-    }
-    if (status === 204 || status === 205) {
-      return;
-    }
-    // GitHub API returns 200 for HEAD requests
-    if (requestOptions.method === "HEAD") {
-      if (status < 400) {
-        return;
-      }
-      throw new requestError.RequestError(response.statusText, status, {
-        response: {
-          url,
-          status,
-          headers,
-          data: undefined
         },
-        request: requestOptions
-      });
-    }
-    if (status === 304) {
-      throw new requestError.RequestError("Not modified", status, {
-        response: {
-          url,
-          status,
-          headers,
-          data: await getResponseData(response)
+        fail(error) {
+            if (status === 'pending') {
+                status = 'rejected';
+                fail(error);
+            }
         },
-        request: requestOptions
-      });
-    }
-    if (status >= 400) {
-      const data = await getResponseData(response);
-      const error = new requestError.RequestError(toErrorMessage(data), status, {
-        response: {
-          url,
-          status,
-          headers,
-          data
+        get fulfilled() {
+            return status !== 'pending';
         },
-        request: requestOptions
-      });
-      throw error;
-    }
-    return getResponseData(response);
-  }).then(data => {
-    return {
-      status,
-      url,
-      headers,
-      data
+        get status() {
+            return status;
+        },
     };
-  }).catch(error => {
-    if (error instanceof requestError.RequestError) throw error;else if (error.name === "AbortError") throw error;
-    throw new requestError.RequestError(error.message, 500, {
-      request: requestOptions
-    });
-  });
 }
-async function getResponseData(response) {
-  const contentType = response.headers.get("content-type");
-  if (/application\/json/.test(contentType)) {
-    return response.json();
-  }
-  if (!contentType || /^text\/|charset=utf-8$/.test(contentType)) {
-    return response.text();
-  }
-  return getBufferResponse(response);
-}
-function toErrorMessage(data) {
-  if (typeof data === "string") return data;
-  // istanbul ignore else - just in case
-  if ("message" in data) {
-    if (Array.isArray(data.errors)) {
-      return `${data.message}: ${data.errors.map(JSON.stringify).join(", ")}`;
-    }
-    return data.message;
-  }
-  // istanbul ignore next - just in case
-  return `Unknown error: ${JSON.stringify(data)}`;
-}
-
-function withDefaults(oldEndpoint, newDefaults) {
-  const endpoint = oldEndpoint.defaults(newDefaults);
-  const newApi = function (route, parameters) {
-    const endpointOptions = endpoint.merge(route, parameters);
-    if (!endpointOptions.request || !endpointOptions.request.hook) {
-      return fetchWrapper(endpoint.parse(endpointOptions));
-    }
-    const request = (route, parameters) => {
-      return fetchWrapper(endpoint.parse(endpoint.merge(route, parameters)));
-    };
-    Object.assign(request, {
-      endpoint,
-      defaults: withDefaults.bind(null, endpoint)
-    });
-    return endpointOptions.request.hook(request, endpointOptions);
-  };
-  return Object.assign(newApi, {
-    endpoint,
-    defaults: withDefaults.bind(null, endpoint)
-  });
-}
-
-const request = withDefaults(endpoint.endpoint, {
-  headers: {
-    "user-agent": `octokit-request.js/${VERSION} ${universalUserAgent.getUserAgent()}`
-  }
-});
-
-exports.request = request;
+exports.deferred = deferred;
+/**
+ * Alias of the exported `deferred` function, to help consumers wanting to use `deferred` as the
+ * local variable name rather than the factory import name, without needing to rename on import.
+ *
+ * ```typescript
+ import {createDeferred} from '@kwsites/promise-deferred`;
+ ```
+ */
+exports.createDeferred = deferred;
+/**
+ * Default export allows use as:
+ *
+ * ```typescript
+ import deferred from '@kwsites/promise-deferred`;
+ ```
+ */
+exports["default"] = deferred;
 //# sourceMappingURL=index.js.map
-
-
-/***/ }),
-
-/***/ 5375:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-
-var core = __nccwpck_require__(6762);
-var pluginRequestLog = __nccwpck_require__(8883);
-var pluginPaginateRest = __nccwpck_require__(4193);
-var pluginRestEndpointMethods = __nccwpck_require__(3044);
-
-const VERSION = "19.0.7";
-
-const Octokit = core.Octokit.plugin(pluginRequestLog.requestLog, pluginRestEndpointMethods.legacyRestEndpointMethods, pluginPaginateRest.paginateRest).defaults({
-  userAgent: `octokit-rest.js/${VERSION}`
-});
-
-exports.Octokit = Octokit;
-//# sourceMappingURL=index.js.map
-
 
 /***/ }),
 
@@ -4888,491 +2815,896 @@ module.exports = HttpsAgent;
 
 /***/ }),
 
-/***/ 9417:
-/***/ ((module) => {
+/***/ 9805:
+/***/ ((module, exports, __nccwpck_require__) => {
 
-"use strict";
+const nodeFetch = __nccwpck_require__(467)
+const realFetch = nodeFetch.default || nodeFetch
 
-module.exports = balanced;
-function balanced(a, b, str) {
-  if (a instanceof RegExp) a = maybeMatch(a, str);
-  if (b instanceof RegExp) b = maybeMatch(b, str);
-
-  var r = range(a, b, str);
-
-  return r && {
-    start: r[0],
-    end: r[1],
-    pre: str.slice(0, r[0]),
-    body: str.slice(r[0] + a.length, r[1]),
-    post: str.slice(r[1] + b.length)
-  };
-}
-
-function maybeMatch(reg, str) {
-  var m = str.match(reg);
-  return m ? m[0] : null;
-}
-
-balanced.range = range;
-function range(a, b, str) {
-  var begs, beg, left, right, result;
-  var ai = str.indexOf(a);
-  var bi = str.indexOf(b, ai + 1);
-  var i = ai;
-
-  if (ai >= 0 && bi > 0) {
-    if(a===b) {
-      return [ai, bi];
-    }
-    begs = [];
-    left = str.length;
-
-    while (i >= 0 && !result) {
-      if (i == ai) {
-        begs.push(i);
-        ai = str.indexOf(a, i + 1);
-      } else if (begs.length == 1) {
-        result = [ begs.pop(), bi ];
-      } else {
-        beg = begs.pop();
-        if (beg < left) {
-          left = beg;
-          right = bi;
-        }
-
-        bi = str.indexOf(b, i + 1);
-      }
-
-      i = ai < bi && ai >= 0 ? ai : bi;
-    }
-
-    if (begs.length) {
-      result = [ left, right ];
-    }
+const fetch = function (url, options) {
+  // Support schemaless URIs on the server for parity with the browser.
+  // Ex: //github.com/ -> https://github.com/
+  if (/^\/\//.test(url)) {
+    url = 'https:' + url
   }
-
-  return result;
+  return realFetch.call(this, url, options)
 }
+
+fetch.ponyfill = true
+
+module.exports = exports = fetch
+exports.fetch = fetch
+exports.Headers = nodeFetch.Headers
+exports.Request = nodeFetch.Request
+exports.Response = nodeFetch.Response
+
+// Needed for TypeScript consumers without esModuleInterop.
+exports["default"] = fetch
 
 
 /***/ }),
 
-/***/ 3682:
+/***/ 8222:
+/***/ ((module, exports, __nccwpck_require__) => {
+
+/* eslint-env browser */
+
+/**
+ * This is the web browser implementation of `debug()`.
+ */
+
+exports.formatArgs = formatArgs;
+exports.save = save;
+exports.load = load;
+exports.useColors = useColors;
+exports.storage = localstorage();
+exports.destroy = (() => {
+	let warned = false;
+
+	return () => {
+		if (!warned) {
+			warned = true;
+			console.warn('Instance method `debug.destroy()` is deprecated and no longer does anything. It will be removed in the next major version of `debug`.');
+		}
+	};
+})();
+
+/**
+ * Colors.
+ */
+
+exports.colors = [
+	'#0000CC',
+	'#0000FF',
+	'#0033CC',
+	'#0033FF',
+	'#0066CC',
+	'#0066FF',
+	'#0099CC',
+	'#0099FF',
+	'#00CC00',
+	'#00CC33',
+	'#00CC66',
+	'#00CC99',
+	'#00CCCC',
+	'#00CCFF',
+	'#3300CC',
+	'#3300FF',
+	'#3333CC',
+	'#3333FF',
+	'#3366CC',
+	'#3366FF',
+	'#3399CC',
+	'#3399FF',
+	'#33CC00',
+	'#33CC33',
+	'#33CC66',
+	'#33CC99',
+	'#33CCCC',
+	'#33CCFF',
+	'#6600CC',
+	'#6600FF',
+	'#6633CC',
+	'#6633FF',
+	'#66CC00',
+	'#66CC33',
+	'#9900CC',
+	'#9900FF',
+	'#9933CC',
+	'#9933FF',
+	'#99CC00',
+	'#99CC33',
+	'#CC0000',
+	'#CC0033',
+	'#CC0066',
+	'#CC0099',
+	'#CC00CC',
+	'#CC00FF',
+	'#CC3300',
+	'#CC3333',
+	'#CC3366',
+	'#CC3399',
+	'#CC33CC',
+	'#CC33FF',
+	'#CC6600',
+	'#CC6633',
+	'#CC9900',
+	'#CC9933',
+	'#CCCC00',
+	'#CCCC33',
+	'#FF0000',
+	'#FF0033',
+	'#FF0066',
+	'#FF0099',
+	'#FF00CC',
+	'#FF00FF',
+	'#FF3300',
+	'#FF3333',
+	'#FF3366',
+	'#FF3399',
+	'#FF33CC',
+	'#FF33FF',
+	'#FF6600',
+	'#FF6633',
+	'#FF9900',
+	'#FF9933',
+	'#FFCC00',
+	'#FFCC33'
+];
+
+/**
+ * Currently only WebKit-based Web Inspectors, Firefox >= v31,
+ * and the Firebug extension (any Firefox version) are known
+ * to support "%c" CSS customizations.
+ *
+ * TODO: add a `localStorage` variable to explicitly enable/disable colors
+ */
+
+// eslint-disable-next-line complexity
+function useColors() {
+	// NB: In an Electron preload script, document will be defined but not fully
+	// initialized. Since we know we're in Chrome, we'll just detect this case
+	// explicitly
+	if (typeof window !== 'undefined' && window.process && (window.process.type === 'renderer' || window.process.__nwjs)) {
+		return true;
+	}
+
+	// Internet Explorer and Edge do not support colors.
+	if (typeof navigator !== 'undefined' && navigator.userAgent && navigator.userAgent.toLowerCase().match(/(edge|trident)\/(\d+)/)) {
+		return false;
+	}
+
+	let m;
+
+	// Is webkit? http://stackoverflow.com/a/16459606/376773
+	// document is undefined in react-native: https://github.com/facebook/react-native/pull/1632
+	// eslint-disable-next-line no-return-assign
+	return (typeof document !== 'undefined' && document.documentElement && document.documentElement.style && document.documentElement.style.WebkitAppearance) ||
+		// Is firebug? http://stackoverflow.com/a/398120/376773
+		(typeof window !== 'undefined' && window.console && (window.console.firebug || (window.console.exception && window.console.table))) ||
+		// Is firefox >= v31?
+		// https://developer.mozilla.org/en-US/docs/Tools/Web_Console#Styling_messages
+		(typeof navigator !== 'undefined' && navigator.userAgent && (m = navigator.userAgent.toLowerCase().match(/firefox\/(\d+)/)) && parseInt(m[1], 10) >= 31) ||
+		// Double check webkit in userAgent just in case we are in a worker
+		(typeof navigator !== 'undefined' && navigator.userAgent && navigator.userAgent.toLowerCase().match(/applewebkit\/(\d+)/));
+}
+
+/**
+ * Colorize log arguments if enabled.
+ *
+ * @api public
+ */
+
+function formatArgs(args) {
+	args[0] = (this.useColors ? '%c' : '') +
+		this.namespace +
+		(this.useColors ? ' %c' : ' ') +
+		args[0] +
+		(this.useColors ? '%c ' : ' ') +
+		'+' + module.exports.humanize(this.diff);
+
+	if (!this.useColors) {
+		return;
+	}
+
+	const c = 'color: ' + this.color;
+	args.splice(1, 0, c, 'color: inherit');
+
+	// The final "%c" is somewhat tricky, because there could be other
+	// arguments passed either before or after the %c, so we need to
+	// figure out the correct index to insert the CSS into
+	let index = 0;
+	let lastC = 0;
+	args[0].replace(/%[a-zA-Z%]/g, match => {
+		if (match === '%%') {
+			return;
+		}
+		index++;
+		if (match === '%c') {
+			// We only are interested in the *last* %c
+			// (the user may have provided their own)
+			lastC = index;
+		}
+	});
+
+	args.splice(lastC, 0, c);
+}
+
+/**
+ * Invokes `console.debug()` when available.
+ * No-op when `console.debug` is not a "function".
+ * If `console.debug` is not available, falls back
+ * to `console.log`.
+ *
+ * @api public
+ */
+exports.log = console.debug || console.log || (() => {});
+
+/**
+ * Save `namespaces`.
+ *
+ * @param {String} namespaces
+ * @api private
+ */
+function save(namespaces) {
+	try {
+		if (namespaces) {
+			exports.storage.setItem('debug', namespaces);
+		} else {
+			exports.storage.removeItem('debug');
+		}
+	} catch (error) {
+		// Swallow
+		// XXX (@Qix-) should we be logging these?
+	}
+}
+
+/**
+ * Load `namespaces`.
+ *
+ * @return {String} returns the previously persisted debug modes
+ * @api private
+ */
+function load() {
+	let r;
+	try {
+		r = exports.storage.getItem('debug');
+	} catch (error) {
+		// Swallow
+		// XXX (@Qix-) should we be logging these?
+	}
+
+	// If debug isn't set in LS, and we're in Electron, try to load $DEBUG
+	if (!r && typeof process !== 'undefined' && 'env' in process) {
+		r = process.env.DEBUG;
+	}
+
+	return r;
+}
+
+/**
+ * Localstorage attempts to return the localstorage.
+ *
+ * This is necessary because safari throws
+ * when a user disables cookies/localstorage
+ * and you attempt to access it.
+ *
+ * @return {LocalStorage}
+ * @api private
+ */
+
+function localstorage() {
+	try {
+		// TVMLKit (Apple TV JS Runtime) does not have a window object, just localStorage in the global context
+		// The Browser also has localStorage in the global context.
+		return localStorage;
+	} catch (error) {
+		// Swallow
+		// XXX (@Qix-) should we be logging these?
+	}
+}
+
+module.exports = __nccwpck_require__(6243)(exports);
+
+const {formatters} = module.exports;
+
+/**
+ * Map %j to `JSON.stringify()`, since no Web Inspectors do that by default.
+ */
+
+formatters.j = function (v) {
+	try {
+		return JSON.stringify(v);
+	} catch (error) {
+		return '[UnexpectedJSONParseError]: ' + error.message;
+	}
+};
+
+
+/***/ }),
+
+/***/ 6243:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var register = __nccwpck_require__(4670);
-var addHook = __nccwpck_require__(5549);
-var removeHook = __nccwpck_require__(6819);
 
-// bind with array of arguments: https://stackoverflow.com/a/21792913
-var bind = Function.bind;
-var bindable = bind.bind(bind);
+/**
+ * This is the common logic for both the Node.js and web browser
+ * implementations of `debug()`.
+ */
 
-function bindApi(hook, state, name) {
-  var removeHookRef = bindable(removeHook, null).apply(
-    null,
-    name ? [state, name] : [state]
-  );
-  hook.api = { remove: removeHookRef };
-  hook.remove = removeHookRef;
-  ["before", "error", "after", "wrap"].forEach(function (kind) {
-    var args = name ? [state, kind, name] : [state, kind];
-    hook[kind] = hook.api[kind] = bindable(addHook, null).apply(null, args);
-  });
+function setup(env) {
+	createDebug.debug = createDebug;
+	createDebug.default = createDebug;
+	createDebug.coerce = coerce;
+	createDebug.disable = disable;
+	createDebug.enable = enable;
+	createDebug.enabled = enabled;
+	createDebug.humanize = __nccwpck_require__(900);
+	createDebug.destroy = destroy;
+
+	Object.keys(env).forEach(key => {
+		createDebug[key] = env[key];
+	});
+
+	/**
+	* The currently active debug mode names, and names to skip.
+	*/
+
+	createDebug.names = [];
+	createDebug.skips = [];
+
+	/**
+	* Map of special "%n" handling functions, for the debug "format" argument.
+	*
+	* Valid key names are a single, lower or upper-case letter, i.e. "n" and "N".
+	*/
+	createDebug.formatters = {};
+
+	/**
+	* Selects a color for a debug namespace
+	* @param {String} namespace The namespace string for the debug instance to be colored
+	* @return {Number|String} An ANSI color code for the given namespace
+	* @api private
+	*/
+	function selectColor(namespace) {
+		let hash = 0;
+
+		for (let i = 0; i < namespace.length; i++) {
+			hash = ((hash << 5) - hash) + namespace.charCodeAt(i);
+			hash |= 0; // Convert to 32bit integer
+		}
+
+		return createDebug.colors[Math.abs(hash) % createDebug.colors.length];
+	}
+	createDebug.selectColor = selectColor;
+
+	/**
+	* Create a debugger with the given `namespace`.
+	*
+	* @param {String} namespace
+	* @return {Function}
+	* @api public
+	*/
+	function createDebug(namespace) {
+		let prevTime;
+		let enableOverride = null;
+		let namespacesCache;
+		let enabledCache;
+
+		function debug(...args) {
+			// Disabled?
+			if (!debug.enabled) {
+				return;
+			}
+
+			const self = debug;
+
+			// Set `diff` timestamp
+			const curr = Number(new Date());
+			const ms = curr - (prevTime || curr);
+			self.diff = ms;
+			self.prev = prevTime;
+			self.curr = curr;
+			prevTime = curr;
+
+			args[0] = createDebug.coerce(args[0]);
+
+			if (typeof args[0] !== 'string') {
+				// Anything else let's inspect with %O
+				args.unshift('%O');
+			}
+
+			// Apply any `formatters` transformations
+			let index = 0;
+			args[0] = args[0].replace(/%([a-zA-Z%])/g, (match, format) => {
+				// If we encounter an escaped % then don't increase the array index
+				if (match === '%%') {
+					return '%';
+				}
+				index++;
+				const formatter = createDebug.formatters[format];
+				if (typeof formatter === 'function') {
+					const val = args[index];
+					match = formatter.call(self, val);
+
+					// Now we need to remove `args[index]` since it's inlined in the `format`
+					args.splice(index, 1);
+					index--;
+				}
+				return match;
+			});
+
+			// Apply env-specific formatting (colors, etc.)
+			createDebug.formatArgs.call(self, args);
+
+			const logFn = self.log || createDebug.log;
+			logFn.apply(self, args);
+		}
+
+		debug.namespace = namespace;
+		debug.useColors = createDebug.useColors();
+		debug.color = createDebug.selectColor(namespace);
+		debug.extend = extend;
+		debug.destroy = createDebug.destroy; // XXX Temporary. Will be removed in the next major release.
+
+		Object.defineProperty(debug, 'enabled', {
+			enumerable: true,
+			configurable: false,
+			get: () => {
+				if (enableOverride !== null) {
+					return enableOverride;
+				}
+				if (namespacesCache !== createDebug.namespaces) {
+					namespacesCache = createDebug.namespaces;
+					enabledCache = createDebug.enabled(namespace);
+				}
+
+				return enabledCache;
+			},
+			set: v => {
+				enableOverride = v;
+			}
+		});
+
+		// Env-specific initialization logic for debug instances
+		if (typeof createDebug.init === 'function') {
+			createDebug.init(debug);
+		}
+
+		return debug;
+	}
+
+	function extend(namespace, delimiter) {
+		const newDebug = createDebug(this.namespace + (typeof delimiter === 'undefined' ? ':' : delimiter) + namespace);
+		newDebug.log = this.log;
+		return newDebug;
+	}
+
+	/**
+	* Enables a debug mode by namespaces. This can include modes
+	* separated by a colon and wildcards.
+	*
+	* @param {String} namespaces
+	* @api public
+	*/
+	function enable(namespaces) {
+		createDebug.save(namespaces);
+		createDebug.namespaces = namespaces;
+
+		createDebug.names = [];
+		createDebug.skips = [];
+
+		const split = (typeof namespaces === 'string' ? namespaces : '')
+			.trim()
+			.replace(' ', ',')
+			.split(',')
+			.filter(Boolean);
+
+		for (const ns of split) {
+			if (ns[0] === '-') {
+				createDebug.skips.push(ns.slice(1));
+			} else {
+				createDebug.names.push(ns);
+			}
+		}
+	}
+
+	/**
+	 * Checks if the given string matches a namespace template, honoring
+	 * asterisks as wildcards.
+	 *
+	 * @param {String} search
+	 * @param {String} template
+	 * @return {Boolean}
+	 */
+	function matchesTemplate(search, template) {
+		let searchIndex = 0;
+		let templateIndex = 0;
+		let starIndex = -1;
+		let matchIndex = 0;
+
+		while (searchIndex < search.length) {
+			if (templateIndex < template.length && (template[templateIndex] === search[searchIndex] || template[templateIndex] === '*')) {
+				// Match character or proceed with wildcard
+				if (template[templateIndex] === '*') {
+					starIndex = templateIndex;
+					matchIndex = searchIndex;
+					templateIndex++; // Skip the '*'
+				} else {
+					searchIndex++;
+					templateIndex++;
+				}
+			} else if (starIndex !== -1) { // eslint-disable-line no-negated-condition
+				// Backtrack to the last '*' and try to match more characters
+				templateIndex = starIndex + 1;
+				matchIndex++;
+				searchIndex = matchIndex;
+			} else {
+				return false; // No match
+			}
+		}
+
+		// Handle trailing '*' in template
+		while (templateIndex < template.length && template[templateIndex] === '*') {
+			templateIndex++;
+		}
+
+		return templateIndex === template.length;
+	}
+
+	/**
+	* Disable debug output.
+	*
+	* @return {String} namespaces
+	* @api public
+	*/
+	function disable() {
+		const namespaces = [
+			...createDebug.names,
+			...createDebug.skips.map(namespace => '-' + namespace)
+		].join(',');
+		createDebug.enable('');
+		return namespaces;
+	}
+
+	/**
+	* Returns true if the given mode name is enabled, false otherwise.
+	*
+	* @param {String} name
+	* @return {Boolean}
+	* @api public
+	*/
+	function enabled(name) {
+		for (const skip of createDebug.skips) {
+			if (matchesTemplate(name, skip)) {
+				return false;
+			}
+		}
+
+		for (const ns of createDebug.names) {
+			if (matchesTemplate(name, ns)) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	* Coerce `val`.
+	*
+	* @param {Mixed} val
+	* @return {Mixed}
+	* @api private
+	*/
+	function coerce(val) {
+		if (val instanceof Error) {
+			return val.stack || val.message;
+		}
+		return val;
+	}
+
+	/**
+	* XXX DO NOT USE. This is a temporary stub function.
+	* XXX It WILL be removed in the next major release.
+	*/
+	function destroy() {
+		console.warn('Instance method `debug.destroy()` is deprecated and no longer does anything. It will be removed in the next major version of `debug`.');
+	}
+
+	createDebug.enable(createDebug.load());
+
+	return createDebug;
 }
 
-function HookSingular() {
-  var singularHookName = "h";
-  var singularHookState = {
-    registry: {},
-  };
-  var singularHook = register.bind(null, singularHookState, singularHookName);
-  bindApi(singularHook, singularHookState, singularHookName);
-  return singularHook;
-}
-
-function HookCollection() {
-  var state = {
-    registry: {},
-  };
-
-  var hook = register.bind(null, state);
-  bindApi(hook, state);
-
-  return hook;
-}
-
-var collectionHookDeprecationMessageDisplayed = false;
-function Hook() {
-  if (!collectionHookDeprecationMessageDisplayed) {
-    console.warn(
-      '[before-after-hook]: "Hook()" repurposing warning, use "Hook.Collection()". Read more: https://git.io/upgrade-before-after-hook-to-1.4'
-    );
-    collectionHookDeprecationMessageDisplayed = true;
-  }
-  return HookCollection();
-}
-
-Hook.Singular = HookSingular.bind();
-Hook.Collection = HookCollection.bind();
-
-module.exports = Hook;
-// expose constructors as a named property for TypeScript
-module.exports.Hook = Hook;
-module.exports.Singular = Hook.Singular;
-module.exports.Collection = Hook.Collection;
+module.exports = setup;
 
 
 /***/ }),
 
-/***/ 5549:
-/***/ ((module) => {
-
-module.exports = addHook;
-
-function addHook(state, kind, name, hook) {
-  var orig = hook;
-  if (!state.registry[name]) {
-    state.registry[name] = [];
-  }
-
-  if (kind === "before") {
-    hook = function (method, options) {
-      return Promise.resolve()
-        .then(orig.bind(null, options))
-        .then(method.bind(null, options));
-    };
-  }
-
-  if (kind === "after") {
-    hook = function (method, options) {
-      var result;
-      return Promise.resolve()
-        .then(method.bind(null, options))
-        .then(function (result_) {
-          result = result_;
-          return orig(result, options);
-        })
-        .then(function () {
-          return result;
-        });
-    };
-  }
-
-  if (kind === "error") {
-    hook = function (method, options) {
-      return Promise.resolve()
-        .then(method.bind(null, options))
-        .catch(function (error) {
-          return orig(error, options);
-        });
-    };
-  }
-
-  state.registry[name].push({
-    hook: hook,
-    orig: orig,
-  });
-}
-
-
-/***/ }),
-
-/***/ 4670:
-/***/ ((module) => {
-
-module.exports = register;
-
-function register(state, name, method, options) {
-  if (typeof method !== "function") {
-    throw new Error("method for before hook must be a function");
-  }
-
-  if (!options) {
-    options = {};
-  }
-
-  if (Array.isArray(name)) {
-    return name.reverse().reduce(function (callback, name) {
-      return register.bind(null, state, name, callback, options);
-    }, method)();
-  }
-
-  return Promise.resolve().then(function () {
-    if (!state.registry[name]) {
-      return method(options);
-    }
-
-    return state.registry[name].reduce(function (method, registered) {
-      return registered.hook.bind(null, method, options);
-    }, method)();
-  });
-}
-
-
-/***/ }),
-
-/***/ 6819:
-/***/ ((module) => {
-
-module.exports = removeHook;
-
-function removeHook(state, name, method) {
-  if (!state.registry[name]) {
-    return;
-  }
-
-  var index = state.registry[name]
-    .map(function (registered) {
-      return registered.orig;
-    })
-    .indexOf(method);
-
-  if (index === -1) {
-    return;
-  }
-
-  state.registry[name].splice(index, 1);
-}
-
-
-/***/ }),
-
-/***/ 3717:
+/***/ 8237:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var balanced = __nccwpck_require__(9417);
+/**
+ * Detect Electron renderer / nwjs process, which is node, but we should
+ * treat as a browser.
+ */
 
-module.exports = expandTop;
-
-var escSlash = '\0SLASH'+Math.random()+'\0';
-var escOpen = '\0OPEN'+Math.random()+'\0';
-var escClose = '\0CLOSE'+Math.random()+'\0';
-var escComma = '\0COMMA'+Math.random()+'\0';
-var escPeriod = '\0PERIOD'+Math.random()+'\0';
-
-function numeric(str) {
-  return parseInt(str, 10) == str
-    ? parseInt(str, 10)
-    : str.charCodeAt(0);
+if (typeof process === 'undefined' || process.type === 'renderer' || process.browser === true || process.__nwjs) {
+	module.exports = __nccwpck_require__(8222);
+} else {
+	module.exports = __nccwpck_require__(4874);
 }
-
-function escapeBraces(str) {
-  return str.split('\\\\').join(escSlash)
-            .split('\\{').join(escOpen)
-            .split('\\}').join(escClose)
-            .split('\\,').join(escComma)
-            .split('\\.').join(escPeriod);
-}
-
-function unescapeBraces(str) {
-  return str.split(escSlash).join('\\')
-            .split(escOpen).join('{')
-            .split(escClose).join('}')
-            .split(escComma).join(',')
-            .split(escPeriod).join('.');
-}
-
-
-// Basically just str.split(","), but handling cases
-// where we have nested braced sections, which should be
-// treated as individual members, like {a,{b,c},d}
-function parseCommaParts(str) {
-  if (!str)
-    return [''];
-
-  var parts = [];
-  var m = balanced('{', '}', str);
-
-  if (!m)
-    return str.split(',');
-
-  var pre = m.pre;
-  var body = m.body;
-  var post = m.post;
-  var p = pre.split(',');
-
-  p[p.length-1] += '{' + body + '}';
-  var postParts = parseCommaParts(post);
-  if (post.length) {
-    p[p.length-1] += postParts.shift();
-    p.push.apply(p, postParts);
-  }
-
-  parts.push.apply(parts, p);
-
-  return parts;
-}
-
-function expandTop(str) {
-  if (!str)
-    return [];
-
-  // I don't know why Bash 4.3 does this, but it does.
-  // Anything starting with {} will have the first two bytes preserved
-  // but *only* at the top level, so {},a}b will not expand to anything,
-  // but a{},b}c will be expanded to [a}c,abc].
-  // One could argue that this is a bug in Bash, but since the goal of
-  // this module is to match Bash's rules, we escape a leading {}
-  if (str.substr(0, 2) === '{}') {
-    str = '\\{\\}' + str.substr(2);
-  }
-
-  return expand(escapeBraces(str), true).map(unescapeBraces);
-}
-
-function embrace(str) {
-  return '{' + str + '}';
-}
-function isPadded(el) {
-  return /^-?0\d/.test(el);
-}
-
-function lte(i, y) {
-  return i <= y;
-}
-function gte(i, y) {
-  return i >= y;
-}
-
-function expand(str, isTop) {
-  var expansions = [];
-
-  var m = balanced('{', '}', str);
-  if (!m) return [str];
-
-  // no need to expand pre, since it is guaranteed to be free of brace-sets
-  var pre = m.pre;
-  var post = m.post.length
-    ? expand(m.post, false)
-    : [''];
-
-  if (/\$$/.test(m.pre)) {    
-    for (var k = 0; k < post.length; k++) {
-      var expansion = pre+ '{' + m.body + '}' + post[k];
-      expansions.push(expansion);
-    }
-  } else {
-    var isNumericSequence = /^-?\d+\.\.-?\d+(?:\.\.-?\d+)?$/.test(m.body);
-    var isAlphaSequence = /^[a-zA-Z]\.\.[a-zA-Z](?:\.\.-?\d+)?$/.test(m.body);
-    var isSequence = isNumericSequence || isAlphaSequence;
-    var isOptions = m.body.indexOf(',') >= 0;
-    if (!isSequence && !isOptions) {
-      // {a},b}
-      if (m.post.match(/,.*\}/)) {
-        str = m.pre + '{' + m.body + escClose + m.post;
-        return expand(str);
-      }
-      return [str];
-    }
-
-    var n;
-    if (isSequence) {
-      n = m.body.split(/\.\./);
-    } else {
-      n = parseCommaParts(m.body);
-      if (n.length === 1) {
-        // x{{a,b}}y ==> x{a}y x{b}y
-        n = expand(n[0], false).map(embrace);
-        if (n.length === 1) {
-          return post.map(function(p) {
-            return m.pre + n[0] + p;
-          });
-        }
-      }
-    }
-
-    // at this point, n is the parts, and we know it's not a comma set
-    // with a single entry.
-    var N;
-
-    if (isSequence) {
-      var x = numeric(n[0]);
-      var y = numeric(n[1]);
-      var width = Math.max(n[0].length, n[1].length)
-      var incr = n.length == 3
-        ? Math.abs(numeric(n[2]))
-        : 1;
-      var test = lte;
-      var reverse = y < x;
-      if (reverse) {
-        incr *= -1;
-        test = gte;
-      }
-      var pad = n.some(isPadded);
-
-      N = [];
-
-      for (var i = x; test(i, y); i += incr) {
-        var c;
-        if (isAlphaSequence) {
-          c = String.fromCharCode(i);
-          if (c === '\\')
-            c = '';
-        } else {
-          c = String(i);
-          if (pad) {
-            var need = width - c.length;
-            if (need > 0) {
-              var z = new Array(need + 1).join('0');
-              if (i < 0)
-                c = '-' + z + c.slice(1);
-              else
-                c = z + c;
-            }
-          }
-        }
-        N.push(c);
-      }
-    } else {
-      N = [];
-
-      for (var j = 0; j < n.length; j++) {
-        N.push.apply(N, expand(n[j], false));
-      }
-    }
-
-    for (var j = 0; j < N.length; j++) {
-      for (var k = 0; k < post.length; k++) {
-        var expansion = pre + N[j] + post[k];
-        if (!isTop || isSequence || expansion)
-          expansions.push(expansion);
-      }
-    }
-  }
-
-  return expansions;
-}
-
 
 
 /***/ }),
 
-/***/ 8932:
-/***/ ((__unused_webpack_module, exports) => {
+/***/ 4874:
+/***/ ((module, exports, __nccwpck_require__) => {
 
-"use strict";
+/**
+ * Module dependencies.
+ */
 
+const tty = __nccwpck_require__(6224);
+const util = __nccwpck_require__(3837);
 
-Object.defineProperty(exports, "__esModule", ({ value: true }));
+/**
+ * This is the Node.js implementation of `debug()`.
+ */
 
-class Deprecation extends Error {
-  constructor(message) {
-    super(message); // Maintains proper stack trace (only available on V8)
+exports.init = init;
+exports.log = log;
+exports.formatArgs = formatArgs;
+exports.save = save;
+exports.load = load;
+exports.useColors = useColors;
+exports.destroy = util.deprecate(
+	() => {},
+	'Instance method `debug.destroy()` is deprecated and no longer does anything. It will be removed in the next major version of `debug`.'
+);
 
-    /* istanbul ignore next */
+/**
+ * Colors.
+ */
 
-    if (Error.captureStackTrace) {
-      Error.captureStackTrace(this, this.constructor);
-    }
+exports.colors = [6, 2, 3, 4, 5, 1];
 
-    this.name = 'Deprecation';
-  }
+try {
+	// Optional dependency (as in, doesn't need to be installed, NOT like optionalDependencies in package.json)
+	// eslint-disable-next-line import/no-extraneous-dependencies
+	const supportsColor = __nccwpck_require__(132);
 
+	if (supportsColor && (supportsColor.stderr || supportsColor).level >= 2) {
+		exports.colors = [
+			20,
+			21,
+			26,
+			27,
+			32,
+			33,
+			38,
+			39,
+			40,
+			41,
+			42,
+			43,
+			44,
+			45,
+			56,
+			57,
+			62,
+			63,
+			68,
+			69,
+			74,
+			75,
+			76,
+			77,
+			78,
+			79,
+			80,
+			81,
+			92,
+			93,
+			98,
+			99,
+			112,
+			113,
+			128,
+			129,
+			134,
+			135,
+			148,
+			149,
+			160,
+			161,
+			162,
+			163,
+			164,
+			165,
+			166,
+			167,
+			168,
+			169,
+			170,
+			171,
+			172,
+			173,
+			178,
+			179,
+			184,
+			185,
+			196,
+			197,
+			198,
+			199,
+			200,
+			201,
+			202,
+			203,
+			204,
+			205,
+			206,
+			207,
+			208,
+			209,
+			214,
+			215,
+			220,
+			221
+		];
+	}
+} catch (error) {
+	// Swallow - we only care if `supports-color` is available; it doesn't have to be.
 }
 
-exports.Deprecation = Deprecation;
+/**
+ * Build up the default `inspectOpts` object from the environment variables.
+ *
+ *   $ DEBUG_COLORS=no DEBUG_DEPTH=10 DEBUG_SHOW_HIDDEN=enabled node script.js
+ */
+
+exports.inspectOpts = Object.keys(process.env).filter(key => {
+	return /^debug_/i.test(key);
+}).reduce((obj, key) => {
+	// Camel-case
+	const prop = key
+		.substring(6)
+		.toLowerCase()
+		.replace(/_([a-z])/g, (_, k) => {
+			return k.toUpperCase();
+		});
+
+	// Coerce string value into JS value
+	let val = process.env[key];
+	if (/^(yes|on|true|enabled)$/i.test(val)) {
+		val = true;
+	} else if (/^(no|off|false|disabled)$/i.test(val)) {
+		val = false;
+	} else if (val === 'null') {
+		val = null;
+	} else {
+		val = Number(val);
+	}
+
+	obj[prop] = val;
+	return obj;
+}, {});
+
+/**
+ * Is stdout a TTY? Colored output is enabled when `true`.
+ */
+
+function useColors() {
+	return 'colors' in exports.inspectOpts ?
+		Boolean(exports.inspectOpts.colors) :
+		tty.isatty(process.stderr.fd);
+}
+
+/**
+ * Adds ANSI color escape codes if enabled.
+ *
+ * @api public
+ */
+
+function formatArgs(args) {
+	const {namespace: name, useColors} = this;
+
+	if (useColors) {
+		const c = this.color;
+		const colorCode = '\u001B[3' + (c < 8 ? c : '8;5;' + c);
+		const prefix = `  ${colorCode};1m${name} \u001B[0m`;
+
+		args[0] = prefix + args[0].split('\n').join('\n' + prefix);
+		args.push(colorCode + 'm+' + module.exports.humanize(this.diff) + '\u001B[0m');
+	} else {
+		args[0] = getDate() + name + ' ' + args[0];
+	}
+}
+
+function getDate() {
+	if (exports.inspectOpts.hideDate) {
+		return '';
+	}
+	return new Date().toISOString() + ' ';
+}
+
+/**
+ * Invokes `util.formatWithOptions()` with the specified arguments and writes to stderr.
+ */
+
+function log(...args) {
+	return process.stderr.write(util.formatWithOptions(exports.inspectOpts, ...args) + '\n');
+}
+
+/**
+ * Save `namespaces`.
+ *
+ * @param {String} namespaces
+ * @api private
+ */
+function save(namespaces) {
+	if (namespaces) {
+		process.env.DEBUG = namespaces;
+	} else {
+		// If you set a process.env field to null or undefined, it gets cast to the
+		// string 'null' or 'undefined'. Just delete instead.
+		delete process.env.DEBUG;
+	}
+}
+
+/**
+ * Load `namespaces`.
+ *
+ * @return {String} returns the previously persisted debug modes
+ * @api private
+ */
+
+function load() {
+	return process.env.DEBUG;
+}
+
+/**
+ * Init logic for `debug` instances.
+ *
+ * Create a new `inspectOpts` object in case `useColors` is set
+ * differently for a particular `debug` instance.
+ */
+
+function init(debug) {
+	debug.inspectOpts = {};
+
+	const keys = Object.keys(exports.inspectOpts);
+	for (let i = 0; i < keys.length; i++) {
+		debug.inspectOpts[keys[i]] = exports.inspectOpts[keys[i]];
+	}
+}
+
+module.exports = __nccwpck_require__(6243)(exports);
+
+const {formatters} = module.exports;
+
+/**
+ * Map %o to `util.inspect()`, all on a single line.
+ */
+
+formatters.o = function (v) {
+	this.inspectOpts.colors = this.useColors;
+	return util.inspect(v, this.inspectOpts)
+		.split('\n')
+		.map(str => str.trim())
+		.join(' ');
+};
+
+/**
+ * Map %O to `util.inspect()`, allowing multiple lines if needed.
+ */
+
+formatters.O = function (v) {
+	this.inspectOpts.colors = this.useColors;
+	return util.inspect(v, this.inspectOpts);
+};
 
 
 /***/ }),
@@ -6271,6 +4603,6463 @@ module.exports.defineEventAttribute = defineEventAttribute
 
 /***/ }),
 
+/***/ 6814:
+/***/ ((module) => {
+
+"use strict";
+
+var __defProp = Object.defineProperty;
+var __defProps = Object.defineProperties;
+var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
+var __getOwnPropDescs = Object.getOwnPropertyDescriptors;
+var __getOwnPropNames = Object.getOwnPropertyNames;
+var __getOwnPropSymbols = Object.getOwnPropertySymbols;
+var __hasOwnProp = Object.prototype.hasOwnProperty;
+var __propIsEnum = Object.prototype.propertyIsEnumerable;
+var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
+var __spreadValues = (a, b) => {
+  for (var prop in b || (b = {}))
+    if (__hasOwnProp.call(b, prop))
+      __defNormalProp(a, prop, b[prop]);
+  if (__getOwnPropSymbols)
+    for (var prop of __getOwnPropSymbols(b)) {
+      if (__propIsEnum.call(b, prop))
+        __defNormalProp(a, prop, b[prop]);
+    }
+  return a;
+};
+var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
+var __objRest = (source, exclude) => {
+  var target = {};
+  for (var prop in source)
+    if (__hasOwnProp.call(source, prop) && exclude.indexOf(prop) < 0)
+      target[prop] = source[prop];
+  if (source != null && __getOwnPropSymbols)
+    for (var prop of __getOwnPropSymbols(source)) {
+      if (exclude.indexOf(prop) < 0 && __propIsEnum.call(source, prop))
+        target[prop] = source[prop];
+    }
+  return target;
+};
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
+};
+var __copyProps = (to, from, except, desc) => {
+  if (from && typeof from === "object" || typeof from === "function") {
+    for (let key of __getOwnPropNames(from))
+      if (!__hasOwnProp.call(to, key) && key !== except)
+        __defProp(to, key, { get: () => from[key], enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable });
+  }
+  return to;
+};
+var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
+
+// src/index.ts
+var src_exports = {};
+__export(src_exports, {
+  Api: () => Api,
+  ContentType: () => ContentType,
+  HttpClient: () => HttpClient,
+  giteaApi: () => giteaApi
+});
+module.exports = __toCommonJS(src_exports);
+
+// src/api.ts
+var ContentType = /* @__PURE__ */ ((ContentType2) => {
+  ContentType2["Json"] = "application/json";
+  ContentType2["FormData"] = "multipart/form-data";
+  ContentType2["UrlEncoded"] = "application/x-www-form-urlencoded";
+  ContentType2["Text"] = "text/plain";
+  return ContentType2;
+})(ContentType || {});
+var HttpClient = class {
+  constructor(apiConfig = {}) {
+    this.baseUrl = "/api/v1";
+    this.securityData = null;
+    this.abortControllers = /* @__PURE__ */ new Map();
+    this.customFetch = (...fetchParams) => fetch(...fetchParams);
+    this.baseApiParams = {
+      credentials: "same-origin",
+      headers: {},
+      redirect: "follow",
+      referrerPolicy: "no-referrer"
+    };
+    this.setSecurityData = (data) => {
+      this.securityData = data;
+    };
+    this.contentFormatters = {
+      ["application/json" /* Json */]: (input) => input !== null && (typeof input === "object" || typeof input === "string") ? JSON.stringify(input) : input,
+      ["text/plain" /* Text */]: (input) => input !== null && typeof input !== "string" ? JSON.stringify(input) : input,
+      ["multipart/form-data" /* FormData */]: (input) => Object.keys(input || {}).reduce((formData, key) => {
+        const property = input[key];
+        formData.append(
+          key,
+          property instanceof Blob ? property : typeof property === "object" && property !== null ? JSON.stringify(property) : `${property}`
+        );
+        return formData;
+      }, new FormData()),
+      ["application/x-www-form-urlencoded" /* UrlEncoded */]: (input) => this.toQueryString(input)
+    };
+    this.createAbortSignal = (cancelToken) => {
+      if (this.abortControllers.has(cancelToken)) {
+        const abortController2 = this.abortControllers.get(cancelToken);
+        if (abortController2) {
+          return abortController2.signal;
+        }
+        return void 0;
+      }
+      const abortController = new AbortController();
+      this.abortControllers.set(cancelToken, abortController);
+      return abortController.signal;
+    };
+    this.abortRequest = (cancelToken) => {
+      const abortController = this.abortControllers.get(cancelToken);
+      if (abortController) {
+        abortController.abort();
+        this.abortControllers.delete(cancelToken);
+      }
+    };
+    this.request = async (_a) => {
+      var _b = _a, {
+        body,
+        secure,
+        path,
+        type,
+        query,
+        format,
+        baseUrl,
+        cancelToken
+      } = _b, params = __objRest(_b, [
+        "body",
+        "secure",
+        "path",
+        "type",
+        "query",
+        "format",
+        "baseUrl",
+        "cancelToken"
+      ]);
+      const secureParams = (typeof secure === "boolean" ? secure : this.baseApiParams.secure) && this.securityWorker && await this.securityWorker(this.securityData) || {};
+      const requestParams = this.mergeRequestParams(params, secureParams);
+      const queryString = query && this.toQueryString(query);
+      const payloadFormatter = this.contentFormatters[type || "application/json" /* Json */];
+      const responseFormat = format || requestParams.format;
+      return this.customFetch(`${baseUrl || this.baseUrl || ""}${path}${queryString ? `?${queryString}` : ""}`, __spreadProps(__spreadValues({}, requestParams), {
+        headers: __spreadValues(__spreadValues({}, requestParams.headers || {}), type && type !== "multipart/form-data" /* FormData */ ? { "Content-Type": type } : {}),
+        signal: (cancelToken ? this.createAbortSignal(cancelToken) : requestParams.signal) || null,
+        body: typeof body === "undefined" || body === null ? null : payloadFormatter(body)
+      })).then(async (response) => {
+        const r = response;
+        r.data = null;
+        r.error = null;
+        const data = !responseFormat ? r : await response[responseFormat]().then((data2) => {
+          if (r.ok) {
+            r.data = data2;
+          } else {
+            r.error = data2;
+          }
+          return r;
+        }).catch((e) => {
+          r.error = e;
+          return r;
+        });
+        if (cancelToken) {
+          this.abortControllers.delete(cancelToken);
+        }
+        if (!response.ok)
+          throw data;
+        return data;
+      });
+    };
+    Object.assign(this, apiConfig);
+  }
+  encodeQueryParam(key, value) {
+    const encodedKey = encodeURIComponent(key);
+    return `${encodedKey}=${encodeURIComponent(typeof value === "number" ? value : `${value}`)}`;
+  }
+  addQueryParam(query, key) {
+    return this.encodeQueryParam(key, query[key]);
+  }
+  addArrayQueryParam(query, key) {
+    const value = query[key];
+    return value.map((v) => this.encodeQueryParam(key, v)).join("&");
+  }
+  toQueryString(rawQuery) {
+    const query = rawQuery || {};
+    const keys = Object.keys(query).filter((key) => "undefined" !== typeof query[key]);
+    return keys.map((key) => Array.isArray(query[key]) ? this.addArrayQueryParam(query, key) : this.addQueryParam(query, key)).join("&");
+  }
+  addQueryParams(rawQuery) {
+    const queryString = this.toQueryString(rawQuery);
+    return queryString ? `?${queryString}` : "";
+  }
+  mergeRequestParams(params1, params2) {
+    return __spreadProps(__spreadValues(__spreadValues(__spreadValues({}, this.baseApiParams), params1), params2 || {}), {
+      headers: __spreadValues(__spreadValues(__spreadValues({}, this.baseApiParams.headers || {}), params1.headers || {}), params2 && params2.headers || {})
+    });
+  }
+};
+var Api = class extends HttpClient {
+  constructor() {
+    super(...arguments);
+    this.activitypub = {
+      /**
+       * No description
+       *
+       * @tags activitypub
+       * @name ActivitypubPerson
+       * @summary Returns the Person actor for a user
+       * @request GET:/activitypub/user-id/{user-id}
+       * @secure
+       */
+      activitypubPerson: (userId, params = {}) => this.request(__spreadValues({
+        path: `/activitypub/user-id/${userId}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags activitypub
+       * @name ActivitypubPersonInbox
+       * @summary Send to the inbox
+       * @request POST:/activitypub/user-id/{user-id}/inbox
+       * @secure
+       */
+      activitypubPersonInbox: (userId, params = {}) => this.request(__spreadValues({
+        path: `/activitypub/user-id/${userId}/inbox`,
+        method: "POST",
+        secure: true
+      }, params))
+    };
+    this.admin = {
+      /**
+       * No description
+       *
+       * @tags admin
+       * @name AdminCronList
+       * @summary List cron tasks
+       * @request GET:/admin/cron
+       * @secure
+       */
+      adminCronList: (query, params = {}) => this.request(__spreadValues({
+        path: `/admin/cron`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags admin
+       * @name AdminCronRun
+       * @summary Run cron task
+       * @request POST:/admin/cron/{task}
+       * @secure
+       */
+      adminCronRun: (task, params = {}) => this.request(__spreadValues({
+        path: `/admin/cron/${task}`,
+        method: "POST",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags admin
+       * @name AdminGetAllEmails
+       * @summary List all emails
+       * @request GET:/admin/emails
+       * @secure
+       */
+      adminGetAllEmails: (query, params = {}) => this.request(__spreadValues({
+        path: `/admin/emails`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags admin
+       * @name AdminSearchEmails
+       * @summary Search all emails
+       * @request GET:/admin/emails/search
+       * @secure
+       */
+      adminSearchEmails: (query, params = {}) => this.request(__spreadValues({
+        path: `/admin/emails/search`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags admin
+       * @name AdminListHooks
+       * @summary List system's webhooks
+       * @request GET:/admin/hooks
+       * @secure
+       */
+      adminListHooks: (query, params = {}) => this.request(__spreadValues({
+        path: `/admin/hooks`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags admin
+       * @name AdminCreateHook
+       * @summary Create a hook
+       * @request POST:/admin/hooks
+       * @secure
+       */
+      adminCreateHook: (body, params = {}) => this.request(__spreadValues({
+        path: `/admin/hooks`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags admin
+       * @name AdminGetHook
+       * @summary Get a hook
+       * @request GET:/admin/hooks/{id}
+       * @secure
+       */
+      adminGetHook: (id, params = {}) => this.request(__spreadValues({
+        path: `/admin/hooks/${id}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags admin
+       * @name AdminDeleteHook
+       * @summary Delete a hook
+       * @request DELETE:/admin/hooks/{id}
+       * @secure
+       */
+      adminDeleteHook: (id, params = {}) => this.request(__spreadValues({
+        path: `/admin/hooks/${id}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags admin
+       * @name AdminEditHook
+       * @summary Update a hook
+       * @request PATCH:/admin/hooks/{id}
+       * @secure
+       */
+      adminEditHook: (id, body, params = {}) => this.request(__spreadValues({
+        path: `/admin/hooks/${id}`,
+        method: "PATCH",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags admin
+       * @name AdminGetAllOrgs
+       * @summary List all organizations
+       * @request GET:/admin/orgs
+       * @secure
+       */
+      adminGetAllOrgs: (query, params = {}) => this.request(__spreadValues({
+        path: `/admin/orgs`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags admin
+       * @name AdminGetRunnerRegistrationToken
+       * @summary Get an global actions runner registration token
+       * @request GET:/admin/runners/registration-token
+       * @secure
+       */
+      adminGetRunnerRegistrationToken: (params = {}) => this.request(__spreadValues({
+        path: `/admin/runners/registration-token`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags admin
+       * @name AdminUnadoptedList
+       * @summary List unadopted repositories
+       * @request GET:/admin/unadopted
+       * @secure
+       */
+      adminUnadoptedList: (query, params = {}) => this.request(__spreadValues({
+        path: `/admin/unadopted`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags admin
+       * @name AdminAdoptRepository
+       * @summary Adopt unadopted files as a repository
+       * @request POST:/admin/unadopted/{owner}/{repo}
+       * @secure
+       */
+      adminAdoptRepository: (owner, repo, params = {}) => this.request(__spreadValues({
+        path: `/admin/unadopted/${owner}/${repo}`,
+        method: "POST",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags admin
+       * @name AdminDeleteUnadoptedRepository
+       * @summary Delete unadopted files
+       * @request DELETE:/admin/unadopted/{owner}/{repo}
+       * @secure
+       */
+      adminDeleteUnadoptedRepository: (owner, repo, params = {}) => this.request(__spreadValues({
+        path: `/admin/unadopted/${owner}/${repo}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags admin
+       * @name AdminSearchUsers
+       * @summary Search users according filter conditions
+       * @request GET:/admin/users
+       * @secure
+       */
+      adminSearchUsers: (query, params = {}) => this.request(__spreadValues({
+        path: `/admin/users`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags admin
+       * @name AdminCreateUser
+       * @summary Create a user
+       * @request POST:/admin/users
+       * @secure
+       */
+      adminCreateUser: (body, params = {}) => this.request(__spreadValues({
+        path: `/admin/users`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags admin
+       * @name AdminDeleteUser
+       * @summary Delete a user
+       * @request DELETE:/admin/users/{username}
+       * @secure
+       */
+      adminDeleteUser: (username, query, params = {}) => this.request(__spreadValues({
+        path: `/admin/users/${username}`,
+        method: "DELETE",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags admin
+       * @name AdminEditUser
+       * @summary Edit an existing user
+       * @request PATCH:/admin/users/{username}
+       * @secure
+       */
+      adminEditUser: (username, body, params = {}) => this.request(__spreadValues({
+        path: `/admin/users/${username}`,
+        method: "PATCH",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags admin
+       * @name AdminListUserBadges
+       * @summary List a user's badges
+       * @request GET:/admin/users/{username}/badges
+       * @secure
+       */
+      adminListUserBadges: (username, params = {}) => this.request(__spreadValues({
+        path: `/admin/users/${username}/badges`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags admin
+       * @name AdminAddUserBadges
+       * @summary Add a badge to a user
+       * @request POST:/admin/users/{username}/badges
+       * @secure
+       */
+      adminAddUserBadges: (username, body, params = {}) => this.request(__spreadValues({
+        path: `/admin/users/${username}/badges`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags admin
+       * @name AdminDeleteUserBadges
+       * @summary Remove a badge from a user
+       * @request DELETE:/admin/users/{username}/badges
+       * @secure
+       */
+      adminDeleteUserBadges: (username, body, params = {}) => this.request(__spreadValues({
+        path: `/admin/users/${username}/badges`,
+        method: "DELETE",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags admin
+       * @name AdminCreatePublicKey
+       * @summary Add a public key on behalf of a user
+       * @request POST:/admin/users/{username}/keys
+       * @secure
+       */
+      adminCreatePublicKey: (username, key, params = {}) => this.request(__spreadValues({
+        path: `/admin/users/${username}/keys`,
+        method: "POST",
+        body: key,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags admin
+       * @name AdminDeleteUserPublicKey
+       * @summary Delete a user's public key
+       * @request DELETE:/admin/users/{username}/keys/{id}
+       * @secure
+       */
+      adminDeleteUserPublicKey: (username, id, params = {}) => this.request(__spreadValues({
+        path: `/admin/users/${username}/keys/${id}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags admin
+       * @name AdminCreateOrg
+       * @summary Create an organization
+       * @request POST:/admin/users/{username}/orgs
+       * @secure
+       */
+      adminCreateOrg: (username, organization, params = {}) => this.request(__spreadValues({
+        path: `/admin/users/${username}/orgs`,
+        method: "POST",
+        body: organization,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags admin
+       * @name AdminRenameUser
+       * @summary Rename a user
+       * @request POST:/admin/users/{username}/rename
+       * @secure
+       */
+      adminRenameUser: (username, body, params = {}) => this.request(__spreadValues({
+        path: `/admin/users/${username}/rename`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags admin
+       * @name AdminCreateRepo
+       * @summary Create a repository on behalf of a user
+       * @request POST:/admin/users/{username}/repos
+       * @secure
+       */
+      adminCreateRepo: (username, repository, params = {}) => this.request(__spreadValues({
+        path: `/admin/users/${username}/repos`,
+        method: "POST",
+        body: repository,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params))
+    };
+    this.gitignore = {
+      /**
+       * No description
+       *
+       * @tags miscellaneous
+       * @name ListGitignoresTemplates
+       * @summary Returns a list of all gitignore templates
+       * @request GET:/gitignore/templates
+       * @secure
+       */
+      listGitignoresTemplates: (params = {}) => this.request(__spreadValues({
+        path: `/gitignore/templates`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags miscellaneous
+       * @name GetGitignoreTemplateInfo
+       * @summary Returns information about a gitignore template
+       * @request GET:/gitignore/templates/{name}
+       * @secure
+       */
+      getGitignoreTemplateInfo: (name, params = {}) => this.request(__spreadValues({
+        path: `/gitignore/templates/${name}`,
+        method: "GET",
+        secure: true
+      }, params))
+    };
+    this.label = {
+      /**
+       * No description
+       *
+       * @tags miscellaneous
+       * @name ListLabelTemplates
+       * @summary Returns a list of all label templates
+       * @request GET:/label/templates
+       * @secure
+       */
+      listLabelTemplates: (params = {}) => this.request(__spreadValues({
+        path: `/label/templates`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags miscellaneous
+       * @name GetLabelTemplateInfo
+       * @summary Returns all labels in a template
+       * @request GET:/label/templates/{name}
+       * @secure
+       */
+      getLabelTemplateInfo: (name, params = {}) => this.request(__spreadValues({
+        path: `/label/templates/${name}`,
+        method: "GET",
+        secure: true
+      }, params))
+    };
+    this.licenses = {
+      /**
+       * No description
+       *
+       * @tags miscellaneous
+       * @name ListLicenseTemplates
+       * @summary Returns a list of all license templates
+       * @request GET:/licenses
+       * @secure
+       */
+      listLicenseTemplates: (params = {}) => this.request(__spreadValues({
+        path: `/licenses`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags miscellaneous
+       * @name GetLicenseTemplateInfo
+       * @summary Returns information about a license template
+       * @request GET:/licenses/{name}
+       * @secure
+       */
+      getLicenseTemplateInfo: (name, params = {}) => this.request(__spreadValues({
+        path: `/licenses/${name}`,
+        method: "GET",
+        secure: true
+      }, params))
+    };
+    this.markdown = {
+      /**
+       * No description
+       *
+       * @tags miscellaneous
+       * @name RenderMarkdown
+       * @summary Render a markdown document as HTML
+       * @request POST:/markdown
+       * @secure
+       */
+      renderMarkdown: (body, params = {}) => this.request(__spreadValues({
+        path: `/markdown`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags miscellaneous
+       * @name RenderMarkdownRaw
+       * @summary Render raw markdown as HTML
+       * @request POST:/markdown/raw
+       * @secure
+       */
+      renderMarkdownRaw: (body, params = {}) => this.request(__spreadValues({
+        path: `/markdown/raw`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "text/plain" /* Text */
+      }, params))
+    };
+    this.markup = {
+      /**
+       * No description
+       *
+       * @tags miscellaneous
+       * @name RenderMarkup
+       * @summary Render a markup document as HTML
+       * @request POST:/markup
+       * @secure
+       */
+      renderMarkup: (body, params = {}) => this.request(__spreadValues({
+        path: `/markup`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params))
+    };
+    this.nodeinfo = {
+      /**
+       * No description
+       *
+       * @tags miscellaneous
+       * @name GetNodeInfo
+       * @summary Returns the nodeinfo of the Gitea application
+       * @request GET:/nodeinfo
+       * @secure
+       */
+      getNodeInfo: (params = {}) => this.request(__spreadValues({
+        path: `/nodeinfo`,
+        method: "GET",
+        secure: true
+      }, params))
+    };
+    this.notifications = {
+      /**
+       * No description
+       *
+       * @tags notification
+       * @name NotifyGetList
+       * @summary List users's notification threads
+       * @request GET:/notifications
+       * @secure
+       */
+      notifyGetList: (query, params = {}) => this.request(__spreadValues({
+        path: `/notifications`,
+        method: "GET",
+        query,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags notification
+       * @name NotifyReadList
+       * @summary Mark notification threads as read, pinned or unread
+       * @request PUT:/notifications
+       * @secure
+       */
+      notifyReadList: (query, params = {}) => this.request(__spreadValues({
+        path: `/notifications`,
+        method: "PUT",
+        query,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags notification
+       * @name NotifyNewAvailable
+       * @summary Check if unread notifications exist
+       * @request GET:/notifications/new
+       * @secure
+       */
+      notifyNewAvailable: (params = {}) => this.request(__spreadValues({
+        path: `/notifications/new`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags notification
+       * @name NotifyGetThread
+       * @summary Get notification thread by ID
+       * @request GET:/notifications/threads/{id}
+       * @secure
+       */
+      notifyGetThread: (id, params = {}) => this.request(__spreadValues({
+        path: `/notifications/threads/${id}`,
+        method: "GET",
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags notification
+       * @name NotifyReadThread
+       * @summary Mark notification thread as read by ID
+       * @request PATCH:/notifications/threads/{id}
+       * @secure
+       */
+      notifyReadThread: (id, query, params = {}) => this.request(__spreadValues({
+        path: `/notifications/threads/${id}`,
+        method: "PATCH",
+        query,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params))
+    };
+    this.org = {
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name CreateOrgRepoDeprecated
+       * @summary Create a repository in an organization
+       * @request POST:/org/{org}/repos
+       * @deprecated
+       * @secure
+       */
+      createOrgRepoDeprecated: (org, body, params = {}) => this.request(__spreadValues({
+        path: `/org/${org}/repos`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params))
+    };
+    this.orgs = {
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgGetAll
+       * @summary Get list of organizations
+       * @request GET:/orgs
+       * @secure
+       */
+      orgGetAll: (query, params = {}) => this.request(__spreadValues({
+        path: `/orgs`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgCreate
+       * @summary Create an organization
+       * @request POST:/orgs
+       * @secure
+       */
+      orgCreate: (organization, params = {}) => this.request(__spreadValues({
+        path: `/orgs`,
+        method: "POST",
+        body: organization,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgGet
+       * @summary Get an organization
+       * @request GET:/orgs/{org}
+       * @secure
+       */
+      orgGet: (org, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgDelete
+       * @summary Delete an organization
+       * @request DELETE:/orgs/{org}
+       * @secure
+       */
+      orgDelete: (org, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgEdit
+       * @summary Edit an organization
+       * @request PATCH:/orgs/{org}
+       * @secure
+       */
+      orgEdit: (org, body, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}`,
+        method: "PATCH",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgGetRunnerRegistrationToken
+       * @summary Get an organization's actions runner registration token
+       * @request GET:/orgs/{org}/actions/runners/registration-token
+       * @secure
+       */
+      orgGetRunnerRegistrationToken: (org, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/actions/runners/registration-token`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgListActionsSecrets
+       * @summary List an organization's actions secrets
+       * @request GET:/orgs/{org}/actions/secrets
+       * @secure
+       */
+      orgListActionsSecrets: (org, query, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/actions/secrets`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name UpdateOrgSecret
+       * @summary Create or Update a secret value in an organization
+       * @request PUT:/orgs/{org}/actions/secrets/{secretname}
+       * @secure
+       */
+      updateOrgSecret: (org, secretname, body, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/actions/secrets/${secretname}`,
+        method: "PUT",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name DeleteOrgSecret
+       * @summary Delete a secret in an organization
+       * @request DELETE:/orgs/{org}/actions/secrets/{secretname}
+       * @secure
+       */
+      deleteOrgSecret: (org, secretname, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/actions/secrets/${secretname}`,
+        method: "DELETE",
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name GetOrgVariablesList
+       * @summary Get an org-level variables list
+       * @request GET:/orgs/{org}/actions/variables
+       * @secure
+       */
+      getOrgVariablesList: (org, query, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/actions/variables`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name GetOrgVariable
+       * @summary Get an org-level variable
+       * @request GET:/orgs/{org}/actions/variables/{variablename}
+       * @secure
+       */
+      getOrgVariable: (org, variablename, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/actions/variables/${variablename}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name UpdateOrgVariable
+       * @summary Update an org-level variable
+       * @request PUT:/orgs/{org}/actions/variables/{variablename}
+       * @secure
+       */
+      updateOrgVariable: (org, variablename, body, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/actions/variables/${variablename}`,
+        method: "PUT",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name CreateOrgVariable
+       * @summary Create an org-level variable
+       * @request POST:/orgs/{org}/actions/variables/{variablename}
+       * @secure
+       */
+      createOrgVariable: (org, variablename, body, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/actions/variables/${variablename}`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name DeleteOrgVariable
+       * @summary Delete an org-level variable
+       * @request DELETE:/orgs/{org}/actions/variables/{variablename}
+       * @secure
+       */
+      deleteOrgVariable: (org, variablename, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/actions/variables/${variablename}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgListActivityFeeds
+       * @summary List an organization's activity feeds
+       * @request GET:/orgs/{org}/activities/feeds
+       * @secure
+       */
+      orgListActivityFeeds: (org, query, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/activities/feeds`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgUpdateAvatar
+       * @summary Update Avatar
+       * @request POST:/orgs/{org}/avatar
+       * @secure
+       */
+      orgUpdateAvatar: (org, body, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/avatar`,
+        method: "POST",
+        body,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgDeleteAvatar
+       * @summary Delete Avatar
+       * @request DELETE:/orgs/{org}/avatar
+       * @secure
+       */
+      orgDeleteAvatar: (org, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/avatar`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrganizationListBlocks
+       * @summary List users blocked by the organization
+       * @request GET:/orgs/{org}/blocks
+       * @secure
+       */
+      organizationListBlocks: (org, query, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/blocks`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrganizationCheckUserBlock
+       * @summary Check if a user is blocked by the organization
+       * @request GET:/orgs/{org}/blocks/{username}
+       * @secure
+       */
+      organizationCheckUserBlock: (org, username, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/blocks/${username}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrganizationBlockUser
+       * @summary Block a user
+       * @request PUT:/orgs/{org}/blocks/{username}
+       * @secure
+       */
+      organizationBlockUser: (org, username, query, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/blocks/${username}`,
+        method: "PUT",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrganizationUnblockUser
+       * @summary Unblock a user
+       * @request DELETE:/orgs/{org}/blocks/{username}
+       * @secure
+       */
+      organizationUnblockUser: (org, username, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/blocks/${username}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgListHooks
+       * @summary List an organization's webhooks
+       * @request GET:/orgs/{org}/hooks
+       * @secure
+       */
+      orgListHooks: (org, query, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/hooks`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgCreateHook
+       * @summary Create a hook
+       * @request POST:/orgs/{org}/hooks
+       * @secure
+       */
+      orgCreateHook: (org, body, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/hooks`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgGetHook
+       * @summary Get a hook
+       * @request GET:/orgs/{org}/hooks/{id}
+       * @secure
+       */
+      orgGetHook: (org, id, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/hooks/${id}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgDeleteHook
+       * @summary Delete a hook
+       * @request DELETE:/orgs/{org}/hooks/{id}
+       * @secure
+       */
+      orgDeleteHook: (org, id, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/hooks/${id}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgEditHook
+       * @summary Update a hook
+       * @request PATCH:/orgs/{org}/hooks/{id}
+       * @secure
+       */
+      orgEditHook: (org, id, body, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/hooks/${id}`,
+        method: "PATCH",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgListLabels
+       * @summary List an organization's labels
+       * @request GET:/orgs/{org}/labels
+       * @secure
+       */
+      orgListLabels: (org, query, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/labels`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgCreateLabel
+       * @summary Create a label for an organization
+       * @request POST:/orgs/{org}/labels
+       * @secure
+       */
+      orgCreateLabel: (org, body, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/labels`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgGetLabel
+       * @summary Get a single label
+       * @request GET:/orgs/{org}/labels/{id}
+       * @secure
+       */
+      orgGetLabel: (org, id, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/labels/${id}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgDeleteLabel
+       * @summary Delete a label
+       * @request DELETE:/orgs/{org}/labels/{id}
+       * @secure
+       */
+      orgDeleteLabel: (org, id, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/labels/${id}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgEditLabel
+       * @summary Update a label
+       * @request PATCH:/orgs/{org}/labels/{id}
+       * @secure
+       */
+      orgEditLabel: (org, id, body, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/labels/${id}`,
+        method: "PATCH",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgListMembers
+       * @summary List an organization's members
+       * @request GET:/orgs/{org}/members
+       * @secure
+       */
+      orgListMembers: (org, query, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/members`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgIsMember
+       * @summary Check if a user is a member of an organization
+       * @request GET:/orgs/{org}/members/{username}
+       * @secure
+       */
+      orgIsMember: (org, username, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/members/${username}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgDeleteMember
+       * @summary Remove a member from an organization
+       * @request DELETE:/orgs/{org}/members/{username}
+       * @secure
+       */
+      orgDeleteMember: (org, username, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/members/${username}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgListPublicMembers
+       * @summary List an organization's public members
+       * @request GET:/orgs/{org}/public_members
+       * @secure
+       */
+      orgListPublicMembers: (org, query, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/public_members`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgIsPublicMember
+       * @summary Check if a user is a public member of an organization
+       * @request GET:/orgs/{org}/public_members/{username}
+       * @secure
+       */
+      orgIsPublicMember: (org, username, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/public_members/${username}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgPublicizeMember
+       * @summary Publicize a user's membership
+       * @request PUT:/orgs/{org}/public_members/{username}
+       * @secure
+       */
+      orgPublicizeMember: (org, username, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/public_members/${username}`,
+        method: "PUT",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgConcealMember
+       * @summary Conceal a user's membership
+       * @request DELETE:/orgs/{org}/public_members/{username}
+       * @secure
+       */
+      orgConcealMember: (org, username, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/public_members/${username}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgListRepos
+       * @summary List an organization's repos
+       * @request GET:/orgs/{org}/repos
+       * @secure
+       */
+      orgListRepos: (org, query, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/repos`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name CreateOrgRepo
+       * @summary Create a repository in an organization
+       * @request POST:/orgs/{org}/repos
+       * @secure
+       */
+      createOrgRepo: (org, body, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/repos`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgListTeams
+       * @summary List an organization's teams
+       * @request GET:/orgs/{org}/teams
+       * @secure
+       */
+      orgListTeams: (org, query, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/teams`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgCreateTeam
+       * @summary Create a team
+       * @request POST:/orgs/{org}/teams
+       * @secure
+       */
+      orgCreateTeam: (org, body, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/teams`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name TeamSearch
+       * @summary Search for teams within an organization
+       * @request GET:/orgs/{org}/teams/search
+       * @secure
+       */
+      teamSearch: (org, query, params = {}) => this.request(__spreadValues({
+        path: `/orgs/${org}/teams/search`,
+        method: "GET",
+        query,
+        secure: true,
+        format: "json"
+      }, params))
+    };
+    this.packages = {
+      /**
+       * No description
+       *
+       * @tags package
+       * @name ListPackages
+       * @summary Gets all packages of an owner
+       * @request GET:/packages/{owner}
+       * @secure
+       */
+      listPackages: (owner, query, params = {}) => this.request(__spreadValues({
+        path: `/packages/${owner}`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags package
+       * @name GetPackage
+       * @summary Gets a package
+       * @request GET:/packages/{owner}/{type}/{name}/{version}
+       * @secure
+       */
+      getPackage: (owner, type, name, version, params = {}) => this.request(__spreadValues({
+        path: `/packages/${owner}/${type}/${name}/${version}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags package
+       * @name DeletePackage
+       * @summary Delete a package
+       * @request DELETE:/packages/{owner}/{type}/{name}/{version}
+       * @secure
+       */
+      deletePackage: (owner, type, name, version, params = {}) => this.request(__spreadValues({
+        path: `/packages/${owner}/${type}/${name}/${version}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags package
+       * @name ListPackageFiles
+       * @summary Gets all files of a package
+       * @request GET:/packages/{owner}/{type}/{name}/{version}/files
+       * @secure
+       */
+      listPackageFiles: (owner, type, name, version, params = {}) => this.request(__spreadValues({
+        path: `/packages/${owner}/${type}/${name}/${version}/files`,
+        method: "GET",
+        secure: true
+      }, params))
+    };
+    this.repos = {
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueSearchIssues
+       * @summary Search for issues across the repositories that the user has access to
+       * @request GET:/repos/issues/search
+       * @secure
+       */
+      issueSearchIssues: (query, params = {}) => this.request(__spreadValues({
+        path: `/repos/issues/search`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoMigrate
+       * @summary Migrate a remote git repository
+       * @request POST:/repos/migrate
+       * @secure
+       */
+      repoMigrate: (body, params = {}) => this.request(__spreadValues({
+        path: `/repos/migrate`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoSearch
+       * @summary Search for repositories
+       * @request GET:/repos/search
+       * @secure
+       */
+      repoSearch: (query, params = {}) => this.request(__spreadValues({
+        path: `/repos/search`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGet
+       * @summary Get a repository
+       * @request GET:/repos/{owner}/{repo}
+       * @secure
+       */
+      repoGet: (owner, repo, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoDelete
+       * @summary Delete a repository
+       * @request DELETE:/repos/{owner}/{repo}
+       * @secure
+       */
+      repoDelete: (owner, repo, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoEdit
+       * @summary Edit a repository's properties. Only fields that are set will be changed.
+       * @request PATCH:/repos/{owner}/{repo}
+       * @secure
+       */
+      repoEdit: (owner, repo, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}`,
+        method: "PATCH",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetRunnerRegistrationToken
+       * @summary Get a repository's actions runner registration token
+       * @request GET:/repos/{owner}/{repo}/actions/runners/registration-token
+       * @secure
+       */
+      repoGetRunnerRegistrationToken: (owner, repo, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/actions/runners/registration-token`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoListActionsSecrets
+       * @summary List an repo's actions secrets
+       * @request GET:/repos/{owner}/{repo}/actions/secrets
+       * @secure
+       */
+      repoListActionsSecrets: (owner, repo, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/actions/secrets`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name UpdateRepoSecret
+       * @summary Create or Update a secret value in a repository
+       * @request PUT:/repos/{owner}/{repo}/actions/secrets/{secretname}
+       * @secure
+       */
+      updateRepoSecret: (owner, repo, secretname, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/actions/secrets/${secretname}`,
+        method: "PUT",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name DeleteRepoSecret
+       * @summary Delete a secret in a repository
+       * @request DELETE:/repos/{owner}/{repo}/actions/secrets/{secretname}
+       * @secure
+       */
+      deleteRepoSecret: (owner, repo, secretname, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/actions/secrets/${secretname}`,
+        method: "DELETE",
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name ListActionTasks
+       * @summary List a repository's action tasks
+       * @request GET:/repos/{owner}/{repo}/actions/tasks
+       * @secure
+       */
+      listActionTasks: (owner, repo, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/actions/tasks`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name GetRepoVariablesList
+       * @summary Get repo-level variables list
+       * @request GET:/repos/{owner}/{repo}/actions/variables
+       * @secure
+       */
+      getRepoVariablesList: (owner, repo, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/actions/variables`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name GetRepoVariable
+       * @summary Get a repo-level variable
+       * @request GET:/repos/{owner}/{repo}/actions/variables/{variablename}
+       * @secure
+       */
+      getRepoVariable: (owner, repo, variablename, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/actions/variables/${variablename}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name UpdateRepoVariable
+       * @summary Update a repo-level variable
+       * @request PUT:/repos/{owner}/{repo}/actions/variables/{variablename}
+       * @secure
+       */
+      updateRepoVariable: (owner, repo, variablename, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/actions/variables/${variablename}`,
+        method: "PUT",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name CreateRepoVariable
+       * @summary Create a repo-level variable
+       * @request POST:/repos/{owner}/{repo}/actions/variables/{variablename}
+       * @secure
+       */
+      createRepoVariable: (owner, repo, variablename, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/actions/variables/${variablename}`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name DeleteRepoVariable
+       * @summary Delete a repo-level variable
+       * @request DELETE:/repos/{owner}/{repo}/actions/variables/{variablename}
+       * @secure
+       */
+      deleteRepoVariable: (owner, repo, variablename, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/actions/variables/${variablename}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoListActivityFeeds
+       * @summary List a repository's activity feeds
+       * @request GET:/repos/{owner}/{repo}/activities/feeds
+       * @secure
+       */
+      repoListActivityFeeds: (owner, repo, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/activities/feeds`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetArchive
+       * @summary Get an archive of a repository
+       * @request GET:/repos/{owner}/{repo}/archive/{archive}
+       * @secure
+       */
+      repoGetArchive: (owner, repo, archive, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/archive/${archive}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetAssignees
+       * @summary Return all users that have write access and can be assigned to issues
+       * @request GET:/repos/{owner}/{repo}/assignees
+       * @secure
+       */
+      repoGetAssignees: (owner, repo, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/assignees`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoUpdateAvatar
+       * @summary Update avatar
+       * @request POST:/repos/{owner}/{repo}/avatar
+       * @secure
+       */
+      repoUpdateAvatar: (owner, repo, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/avatar`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoDeleteAvatar
+       * @summary Delete avatar
+       * @request DELETE:/repos/{owner}/{repo}/avatar
+       * @secure
+       */
+      repoDeleteAvatar: (owner, repo, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/avatar`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoListBranchProtection
+       * @summary List branch protections for a repository
+       * @request GET:/repos/{owner}/{repo}/branch_protections
+       * @secure
+       */
+      repoListBranchProtection: (owner, repo, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/branch_protections`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoCreateBranchProtection
+       * @summary Create a branch protections for a repository
+       * @request POST:/repos/{owner}/{repo}/branch_protections
+       * @secure
+       */
+      repoCreateBranchProtection: (owner, repo, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/branch_protections`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoUpdateBranchProtectionPriories
+       * @summary Update the priorities of branch protections for a repository.
+       * @request POST:/repos/{owner}/{repo}/branch_protections/priority
+       * @secure
+       */
+      repoUpdateBranchProtectionPriories: (owner, repo, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/branch_protections/priority`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetBranchProtection
+       * @summary Get a specific branch protection for the repository
+       * @request GET:/repos/{owner}/{repo}/branch_protections/{name}
+       * @secure
+       */
+      repoGetBranchProtection: (owner, repo, name, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/branch_protections/${name}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoDeleteBranchProtection
+       * @summary Delete a specific branch protection for the repository
+       * @request DELETE:/repos/{owner}/{repo}/branch_protections/{name}
+       * @secure
+       */
+      repoDeleteBranchProtection: (owner, repo, name, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/branch_protections/${name}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoEditBranchProtection
+       * @summary Edit a branch protections for a repository. Only fields that are set will be changed
+       * @request PATCH:/repos/{owner}/{repo}/branch_protections/{name}
+       * @secure
+       */
+      repoEditBranchProtection: (owner, repo, name, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/branch_protections/${name}`,
+        method: "PATCH",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoListBranches
+       * @summary List a repository's branches
+       * @request GET:/repos/{owner}/{repo}/branches
+       * @secure
+       */
+      repoListBranches: (owner, repo, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/branches`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoCreateBranch
+       * @summary Create a branch
+       * @request POST:/repos/{owner}/{repo}/branches
+       * @secure
+       */
+      repoCreateBranch: (owner, repo, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/branches`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetBranch
+       * @summary Retrieve a specific branch from a repository, including its effective branch protection
+       * @request GET:/repos/{owner}/{repo}/branches/{branch}
+       * @secure
+       */
+      repoGetBranch: (owner, repo, branch, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/branches/${branch}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoDeleteBranch
+       * @summary Delete a specific branch from a repository
+       * @request DELETE:/repos/{owner}/{repo}/branches/{branch}
+       * @secure
+       */
+      repoDeleteBranch: (owner, repo, branch, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/branches/${branch}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoUpdateBranch
+       * @summary Update a branch
+       * @request PATCH:/repos/{owner}/{repo}/branches/{branch}
+       * @secure
+       */
+      repoUpdateBranch: (owner, repo, branch, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/branches/${branch}`,
+        method: "PATCH",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoListCollaborators
+       * @summary List a repository's collaborators
+       * @request GET:/repos/{owner}/{repo}/collaborators
+       * @secure
+       */
+      repoListCollaborators: (owner, repo, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/collaborators`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoCheckCollaborator
+       * @summary Check if a user is a collaborator of a repository
+       * @request GET:/repos/{owner}/{repo}/collaborators/{collaborator}
+       * @secure
+       */
+      repoCheckCollaborator: (owner, repo, collaborator, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/collaborators/${collaborator}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoAddCollaborator
+       * @summary Add or Update a collaborator to a repository
+       * @request PUT:/repos/{owner}/{repo}/collaborators/{collaborator}
+       * @secure
+       */
+      repoAddCollaborator: (owner, repo, collaborator, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/collaborators/${collaborator}`,
+        method: "PUT",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoDeleteCollaborator
+       * @summary Delete a collaborator from a repository
+       * @request DELETE:/repos/{owner}/{repo}/collaborators/{collaborator}
+       * @secure
+       */
+      repoDeleteCollaborator: (owner, repo, collaborator, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/collaborators/${collaborator}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetRepoPermissions
+       * @summary Get repository permissions for a user
+       * @request GET:/repos/{owner}/{repo}/collaborators/{collaborator}/permission
+       * @secure
+       */
+      repoGetRepoPermissions: (owner, repo, collaborator, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/collaborators/${collaborator}/permission`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetAllCommits
+       * @summary Get a list of all commits from a repository
+       * @request GET:/repos/{owner}/{repo}/commits
+       * @secure
+       */
+      repoGetAllCommits: (owner, repo, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/commits`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetCombinedStatusByRef
+       * @summary Get a commit's combined status, by branch/tag/commit reference
+       * @request GET:/repos/{owner}/{repo}/commits/{ref}/status
+       * @secure
+       */
+      repoGetCombinedStatusByRef: (owner, repo, ref, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/commits/${ref}/status`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoListStatusesByRef
+       * @summary Get a commit's statuses, by branch/tag/commit reference
+       * @request GET:/repos/{owner}/{repo}/commits/{ref}/statuses
+       * @secure
+       */
+      repoListStatusesByRef: (owner, repo, ref, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/commits/${ref}/statuses`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetCommitPullRequest
+       * @summary Get the merged pull request of the commit
+       * @request GET:/repos/{owner}/{repo}/commits/{sha}/pull
+       * @secure
+       */
+      repoGetCommitPullRequest: (owner, repo, sha, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/commits/${sha}/pull`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoCompareDiff
+       * @summary Get commit comparison information
+       * @request GET:/repos/{owner}/{repo}/compare/{basehead}
+       * @secure
+       */
+      repoCompareDiff: (owner, repo, basehead, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/compare/${basehead}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetContentsList
+       * @summary Gets the metadata of all the entries of the root dir
+       * @request GET:/repos/{owner}/{repo}/contents
+       * @secure
+       */
+      repoGetContentsList: (owner, repo, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/contents`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoChangeFiles
+       * @summary Modify multiple files in a repository
+       * @request POST:/repos/{owner}/{repo}/contents
+       * @secure
+       */
+      repoChangeFiles: (owner, repo, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/contents`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetContents
+       * @summary Gets the metadata and contents (if a file) of an entry in a repository, or a list of entries if a dir
+       * @request GET:/repos/{owner}/{repo}/contents/{filepath}
+       * @secure
+       */
+      repoGetContents: (owner, repo, filepath, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/contents/${filepath}`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoUpdateFile
+       * @summary Update a file in a repository
+       * @request PUT:/repos/{owner}/{repo}/contents/{filepath}
+       * @secure
+       */
+      repoUpdateFile: (owner, repo, filepath, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/contents/${filepath}`,
+        method: "PUT",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoCreateFile
+       * @summary Create a file in a repository
+       * @request POST:/repos/{owner}/{repo}/contents/{filepath}
+       * @secure
+       */
+      repoCreateFile: (owner, repo, filepath, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/contents/${filepath}`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoDeleteFile
+       * @summary Delete a file in a repository
+       * @request DELETE:/repos/{owner}/{repo}/contents/{filepath}
+       * @secure
+       */
+      repoDeleteFile: (owner, repo, filepath, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/contents/${filepath}`,
+        method: "DELETE",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoApplyDiffPatch
+       * @summary Apply diff patch to repository
+       * @request POST:/repos/{owner}/{repo}/diffpatch
+       * @secure
+       */
+      repoApplyDiffPatch: (owner, repo, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/diffpatch`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetEditorConfig
+       * @summary Get the EditorConfig definitions of a file in a repository
+       * @request GET:/repos/{owner}/{repo}/editorconfig/{filepath}
+       * @secure
+       */
+      repoGetEditorConfig: (owner, repo, filepath, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/editorconfig/${filepath}`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name ListForks
+       * @summary List a repository's forks
+       * @request GET:/repos/{owner}/{repo}/forks
+       * @secure
+       */
+      listForks: (owner, repo, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/forks`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name CreateFork
+       * @summary Fork a repository
+       * @request POST:/repos/{owner}/{repo}/forks
+       * @secure
+       */
+      createFork: (owner, repo, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/forks`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name GetBlob
+       * @summary Gets the blob of a repository.
+       * @request GET:/repos/{owner}/{repo}/git/blobs/{sha}
+       * @secure
+       */
+      getBlob: (owner, repo, sha, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/git/blobs/${sha}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetSingleCommit
+       * @summary Get a single commit from a repository
+       * @request GET:/repos/{owner}/{repo}/git/commits/{sha}
+       * @secure
+       */
+      repoGetSingleCommit: (owner, repo, sha, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/git/commits/${sha}`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoDownloadCommitDiffOrPatch
+       * @summary Get a commit's diff or patch
+       * @request GET:/repos/{owner}/{repo}/git/commits/{sha}.{diffType}
+       * @secure
+       */
+      repoDownloadCommitDiffOrPatch: (owner, repo, sha, diffType, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/git/commits/${sha}.${diffType}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetNote
+       * @summary Get a note corresponding to a single commit from a repository
+       * @request GET:/repos/{owner}/{repo}/git/notes/{sha}
+       * @secure
+       */
+      repoGetNote: (owner, repo, sha, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/git/notes/${sha}`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoListAllGitRefs
+       * @summary Get specified ref or filtered repository's refs
+       * @request GET:/repos/{owner}/{repo}/git/refs
+       * @secure
+       */
+      repoListAllGitRefs: (owner, repo, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/git/refs`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoListGitRefs
+       * @summary Get specified ref or filtered repository's refs
+       * @request GET:/repos/{owner}/{repo}/git/refs/{ref}
+       * @secure
+       */
+      repoListGitRefs: (owner, repo, ref, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/git/refs/${ref}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name GetAnnotatedTag
+       * @summary Gets the tag object of an annotated tag (not lightweight tags)
+       * @request GET:/repos/{owner}/{repo}/git/tags/{sha}
+       * @secure
+       */
+      getAnnotatedTag: (owner, repo, sha, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/git/tags/${sha}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name GetTree
+       * @summary Gets the tree of a repository.
+       * @request GET:/repos/{owner}/{repo}/git/trees/{sha}
+       * @secure
+       */
+      getTree: (owner, repo, sha, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/git/trees/${sha}`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoListHooks
+       * @summary List the hooks in a repository
+       * @request GET:/repos/{owner}/{repo}/hooks
+       * @secure
+       */
+      repoListHooks: (owner, repo, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/hooks`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoCreateHook
+       * @summary Create a hook
+       * @request POST:/repos/{owner}/{repo}/hooks
+       * @secure
+       */
+      repoCreateHook: (owner, repo, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/hooks`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoListGitHooks
+       * @summary List the Git hooks in a repository
+       * @request GET:/repos/{owner}/{repo}/hooks/git
+       * @secure
+       */
+      repoListGitHooks: (owner, repo, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/hooks/git`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetGitHook
+       * @summary Get a Git hook
+       * @request GET:/repos/{owner}/{repo}/hooks/git/{id}
+       * @secure
+       */
+      repoGetGitHook: (owner, repo, id, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/hooks/git/${id}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoDeleteGitHook
+       * @summary Delete a Git hook in a repository
+       * @request DELETE:/repos/{owner}/{repo}/hooks/git/{id}
+       * @secure
+       */
+      repoDeleteGitHook: (owner, repo, id, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/hooks/git/${id}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoEditGitHook
+       * @summary Edit a Git hook in a repository
+       * @request PATCH:/repos/{owner}/{repo}/hooks/git/{id}
+       * @secure
+       */
+      repoEditGitHook: (owner, repo, id, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/hooks/git/${id}`,
+        method: "PATCH",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetHook
+       * @summary Get a hook
+       * @request GET:/repos/{owner}/{repo}/hooks/{id}
+       * @secure
+       */
+      repoGetHook: (owner, repo, id, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/hooks/${id}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoDeleteHook
+       * @summary Delete a hook in a repository
+       * @request DELETE:/repos/{owner}/{repo}/hooks/{id}
+       * @secure
+       */
+      repoDeleteHook: (owner, repo, id, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/hooks/${id}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoEditHook
+       * @summary Edit a hook in a repository
+       * @request PATCH:/repos/{owner}/{repo}/hooks/{id}
+       * @secure
+       */
+      repoEditHook: (owner, repo, id, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/hooks/${id}`,
+        method: "PATCH",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoTestHook
+       * @summary Test a push webhook
+       * @request POST:/repos/{owner}/{repo}/hooks/{id}/tests
+       * @secure
+       */
+      repoTestHook: (owner, repo, id, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/hooks/${id}/tests`,
+        method: "POST",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetIssueConfig
+       * @summary Returns the issue config for a repo
+       * @request GET:/repos/{owner}/{repo}/issue_config
+       * @secure
+       */
+      repoGetIssueConfig: (owner, repo, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issue_config`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoValidateIssueConfig
+       * @summary Returns the validation information for a issue config
+       * @request GET:/repos/{owner}/{repo}/issue_config/validate
+       * @secure
+       */
+      repoValidateIssueConfig: (owner, repo, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issue_config/validate`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetIssueTemplates
+       * @summary Get available issue templates for a repository
+       * @request GET:/repos/{owner}/{repo}/issue_templates
+       * @secure
+       */
+      repoGetIssueTemplates: (owner, repo, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issue_templates`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueListIssues
+       * @summary List a repository's issues
+       * @request GET:/repos/{owner}/{repo}/issues
+       * @secure
+       */
+      issueListIssues: (owner, repo, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueCreateIssue
+       * @summary Create an issue. If using deadline only the date will be taken into account, and time of day ignored.
+       * @request POST:/repos/{owner}/{repo}/issues
+       * @secure
+       */
+      issueCreateIssue: (owner, repo, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueGetRepoComments
+       * @summary List all comments in a repository
+       * @request GET:/repos/{owner}/{repo}/issues/comments
+       * @secure
+       */
+      issueGetRepoComments: (owner, repo, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/comments`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueGetComment
+       * @summary Get a comment
+       * @request GET:/repos/{owner}/{repo}/issues/comments/{id}
+       * @secure
+       */
+      issueGetComment: (owner, repo, id, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/comments/${id}`,
+        method: "GET",
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueDeleteComment
+       * @summary Delete a comment
+       * @request DELETE:/repos/{owner}/{repo}/issues/comments/{id}
+       * @secure
+       */
+      issueDeleteComment: (owner, repo, id, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/comments/${id}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueEditComment
+       * @summary Edit a comment
+       * @request PATCH:/repos/{owner}/{repo}/issues/comments/{id}
+       * @secure
+       */
+      issueEditComment: (owner, repo, id, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/comments/${id}`,
+        method: "PATCH",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueListIssueCommentAttachments
+       * @summary List comment's attachments
+       * @request GET:/repos/{owner}/{repo}/issues/comments/{id}/assets
+       * @secure
+       */
+      issueListIssueCommentAttachments: (owner, repo, id, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/comments/${id}/assets`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueCreateIssueCommentAttachment
+       * @summary Create a comment attachment
+       * @request POST:/repos/{owner}/{repo}/issues/comments/{id}/assets
+       * @secure
+       */
+      issueCreateIssueCommentAttachment: (owner, repo, id, data, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/comments/${id}/assets`,
+        method: "POST",
+        query,
+        body: data,
+        secure: true,
+        type: "multipart/form-data" /* FormData */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueGetIssueCommentAttachment
+       * @summary Get a comment attachment
+       * @request GET:/repos/{owner}/{repo}/issues/comments/{id}/assets/{attachment_id}
+       * @secure
+       */
+      issueGetIssueCommentAttachment: (owner, repo, id, attachmentId, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/comments/${id}/assets/${attachmentId}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueDeleteIssueCommentAttachment
+       * @summary Delete a comment attachment
+       * @request DELETE:/repos/{owner}/{repo}/issues/comments/{id}/assets/{attachment_id}
+       * @secure
+       */
+      issueDeleteIssueCommentAttachment: (owner, repo, id, attachmentId, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/comments/${id}/assets/${attachmentId}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueEditIssueCommentAttachment
+       * @summary Edit a comment attachment
+       * @request PATCH:/repos/{owner}/{repo}/issues/comments/{id}/assets/{attachment_id}
+       * @secure
+       */
+      issueEditIssueCommentAttachment: (owner, repo, id, attachmentId, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/comments/${id}/assets/${attachmentId}`,
+        method: "PATCH",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueGetCommentReactions
+       * @summary Get a list of reactions from a comment of an issue
+       * @request GET:/repos/{owner}/{repo}/issues/comments/{id}/reactions
+       * @secure
+       */
+      issueGetCommentReactions: (owner, repo, id, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/comments/${id}/reactions`,
+        method: "GET",
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssuePostCommentReaction
+       * @summary Add a reaction to a comment of an issue
+       * @request POST:/repos/{owner}/{repo}/issues/comments/{id}/reactions
+       * @secure
+       */
+      issuePostCommentReaction: (owner, repo, id, content, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/comments/${id}/reactions`,
+        method: "POST",
+        body: content,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueDeleteCommentReaction
+       * @summary Remove a reaction from a comment of an issue
+       * @request DELETE:/repos/{owner}/{repo}/issues/comments/{id}/reactions
+       * @secure
+       */
+      issueDeleteCommentReaction: (owner, repo, id, content, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/comments/${id}/reactions`,
+        method: "DELETE",
+        body: content,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoListPinnedIssues
+       * @summary List a repo's pinned issues
+       * @request GET:/repos/{owner}/{repo}/issues/pinned
+       * @secure
+       */
+      repoListPinnedIssues: (owner, repo, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/pinned`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueGetIssue
+       * @summary Get an issue
+       * @request GET:/repos/{owner}/{repo}/issues/{index}
+       * @secure
+       */
+      issueGetIssue: (owner, repo, index, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueDelete
+       * @summary Delete an issue
+       * @request DELETE:/repos/{owner}/{repo}/issues/{index}
+       * @secure
+       */
+      issueDelete: (owner, repo, index, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueEditIssue
+       * @summary Edit an issue. If using deadline only the date will be taken into account, and time of day ignored.
+       * @request PATCH:/repos/{owner}/{repo}/issues/{index}
+       * @secure
+       */
+      issueEditIssue: (owner, repo, index, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}`,
+        method: "PATCH",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueListIssueAttachments
+       * @summary List issue's attachments
+       * @request GET:/repos/{owner}/{repo}/issues/{index}/assets
+       * @secure
+       */
+      issueListIssueAttachments: (owner, repo, index, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/assets`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueCreateIssueAttachment
+       * @summary Create an issue attachment
+       * @request POST:/repos/{owner}/{repo}/issues/{index}/assets
+       * @secure
+       */
+      issueCreateIssueAttachment: (owner, repo, index, data, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/assets`,
+        method: "POST",
+        query,
+        body: data,
+        secure: true,
+        type: "multipart/form-data" /* FormData */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueGetIssueAttachment
+       * @summary Get an issue attachment
+       * @request GET:/repos/{owner}/{repo}/issues/{index}/assets/{attachment_id}
+       * @secure
+       */
+      issueGetIssueAttachment: (owner, repo, index, attachmentId, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/assets/${attachmentId}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueDeleteIssueAttachment
+       * @summary Delete an issue attachment
+       * @request DELETE:/repos/{owner}/{repo}/issues/{index}/assets/{attachment_id}
+       * @secure
+       */
+      issueDeleteIssueAttachment: (owner, repo, index, attachmentId, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/assets/${attachmentId}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueEditIssueAttachment
+       * @summary Edit an issue attachment
+       * @request PATCH:/repos/{owner}/{repo}/issues/{index}/assets/{attachment_id}
+       * @secure
+       */
+      issueEditIssueAttachment: (owner, repo, index, attachmentId, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/assets/${attachmentId}`,
+        method: "PATCH",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueListBlocks
+       * @summary List issues that are blocked by this issue
+       * @request GET:/repos/{owner}/{repo}/issues/{index}/blocks
+       * @secure
+       */
+      issueListBlocks: (owner, repo, index, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/blocks`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueCreateIssueBlocking
+       * @summary Block the issue given in the body by the issue in path
+       * @request POST:/repos/{owner}/{repo}/issues/{index}/blocks
+       * @secure
+       */
+      issueCreateIssueBlocking: (owner, repo, index, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/blocks`,
+        method: "POST",
+        body,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueRemoveIssueBlocking
+       * @summary Unblock the issue given in the body by the issue in path
+       * @request DELETE:/repos/{owner}/{repo}/issues/{index}/blocks
+       * @secure
+       */
+      issueRemoveIssueBlocking: (owner, repo, index, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/blocks`,
+        method: "DELETE",
+        body,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueGetComments
+       * @summary List all comments on an issue
+       * @request GET:/repos/{owner}/{repo}/issues/{index}/comments
+       * @secure
+       */
+      issueGetComments: (owner, repo, index, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/comments`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueCreateComment
+       * @summary Add a comment to an issue
+       * @request POST:/repos/{owner}/{repo}/issues/{index}/comments
+       * @secure
+       */
+      issueCreateComment: (owner, repo, index, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/comments`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueDeleteCommentDeprecated
+       * @summary Delete a comment
+       * @request DELETE:/repos/{owner}/{repo}/issues/{index}/comments/{id}
+       * @deprecated
+       * @secure
+       */
+      issueDeleteCommentDeprecated: (owner, repo, index, id, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/comments/${id}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueEditCommentDeprecated
+       * @summary Edit a comment
+       * @request PATCH:/repos/{owner}/{repo}/issues/{index}/comments/{id}
+       * @deprecated
+       * @secure
+       */
+      issueEditCommentDeprecated: (owner, repo, index, id, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/comments/${id}`,
+        method: "PATCH",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueEditIssueDeadline
+       * @summary Set an issue deadline. If set to null, the deadline is deleted. If using deadline only the date will be taken into account, and time of day ignored.
+       * @request POST:/repos/{owner}/{repo}/issues/{index}/deadline
+       * @secure
+       */
+      issueEditIssueDeadline: (owner, repo, index, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/deadline`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueListIssueDependencies
+       * @summary List an issue's dependencies, i.e all issues that block this issue.
+       * @request GET:/repos/{owner}/{repo}/issues/{index}/dependencies
+       * @secure
+       */
+      issueListIssueDependencies: (owner, repo, index, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/dependencies`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueCreateIssueDependencies
+       * @summary Make the issue in the url depend on the issue in the form.
+       * @request POST:/repos/{owner}/{repo}/issues/{index}/dependencies
+       * @secure
+       */
+      issueCreateIssueDependencies: (owner, repo, index, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/dependencies`,
+        method: "POST",
+        body,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueRemoveIssueDependencies
+       * @summary Remove an issue dependency
+       * @request DELETE:/repos/{owner}/{repo}/issues/{index}/dependencies
+       * @secure
+       */
+      issueRemoveIssueDependencies: (owner, repo, index, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/dependencies`,
+        method: "DELETE",
+        body,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueGetLabels
+       * @summary Get an issue's labels
+       * @request GET:/repos/{owner}/{repo}/issues/{index}/labels
+       * @secure
+       */
+      issueGetLabels: (owner, repo, index, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/labels`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueReplaceLabels
+       * @summary Replace an issue's labels
+       * @request PUT:/repos/{owner}/{repo}/issues/{index}/labels
+       * @secure
+       */
+      issueReplaceLabels: (owner, repo, index, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/labels`,
+        method: "PUT",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueAddLabel
+       * @summary Add a label to an issue
+       * @request POST:/repos/{owner}/{repo}/issues/{index}/labels
+       * @secure
+       */
+      issueAddLabel: (owner, repo, index, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/labels`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueClearLabels
+       * @summary Remove all labels from an issue
+       * @request DELETE:/repos/{owner}/{repo}/issues/{index}/labels
+       * @secure
+       */
+      issueClearLabels: (owner, repo, index, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/labels`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueRemoveLabel
+       * @summary Remove a label from an issue
+       * @request DELETE:/repos/{owner}/{repo}/issues/{index}/labels/{id}
+       * @secure
+       */
+      issueRemoveLabel: (owner, repo, index, id, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/labels/${id}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name PinIssue
+       * @summary Pin an Issue
+       * @request POST:/repos/{owner}/{repo}/issues/{index}/pin
+       * @secure
+       */
+      pinIssue: (owner, repo, index, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/pin`,
+        method: "POST",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name UnpinIssue
+       * @summary Unpin an Issue
+       * @request DELETE:/repos/{owner}/{repo}/issues/{index}/pin
+       * @secure
+       */
+      unpinIssue: (owner, repo, index, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/pin`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name MoveIssuePin
+       * @summary Moves the Pin to the given Position
+       * @request PATCH:/repos/{owner}/{repo}/issues/{index}/pin/{position}
+       * @secure
+       */
+      moveIssuePin: (owner, repo, index, position, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/pin/${position}`,
+        method: "PATCH",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueGetIssueReactions
+       * @summary Get a list reactions of an issue
+       * @request GET:/repos/{owner}/{repo}/issues/{index}/reactions
+       * @secure
+       */
+      issueGetIssueReactions: (owner, repo, index, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/reactions`,
+        method: "GET",
+        query,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssuePostIssueReaction
+       * @summary Add a reaction to an issue
+       * @request POST:/repos/{owner}/{repo}/issues/{index}/reactions
+       * @secure
+       */
+      issuePostIssueReaction: (owner, repo, index, content, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/reactions`,
+        method: "POST",
+        body: content,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueDeleteIssueReaction
+       * @summary Remove a reaction from an issue
+       * @request DELETE:/repos/{owner}/{repo}/issues/{index}/reactions
+       * @secure
+       */
+      issueDeleteIssueReaction: (owner, repo, index, content, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/reactions`,
+        method: "DELETE",
+        body: content,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueDeleteStopWatch
+       * @summary Delete an issue's existing stopwatch.
+       * @request DELETE:/repos/{owner}/{repo}/issues/{index}/stopwatch/delete
+       * @secure
+       */
+      issueDeleteStopWatch: (owner, repo, index, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/stopwatch/delete`,
+        method: "DELETE",
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueStartStopWatch
+       * @summary Start stopwatch on an issue.
+       * @request POST:/repos/{owner}/{repo}/issues/{index}/stopwatch/start
+       * @secure
+       */
+      issueStartStopWatch: (owner, repo, index, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/stopwatch/start`,
+        method: "POST",
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueStopStopWatch
+       * @summary Stop an issue's existing stopwatch.
+       * @request POST:/repos/{owner}/{repo}/issues/{index}/stopwatch/stop
+       * @secure
+       */
+      issueStopStopWatch: (owner, repo, index, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/stopwatch/stop`,
+        method: "POST",
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueSubscriptions
+       * @summary Get users who subscribed on an issue.
+       * @request GET:/repos/{owner}/{repo}/issues/{index}/subscriptions
+       * @secure
+       */
+      issueSubscriptions: (owner, repo, index, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/subscriptions`,
+        method: "GET",
+        query,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueCheckSubscription
+       * @summary Check if user is subscribed to an issue
+       * @request GET:/repos/{owner}/{repo}/issues/{index}/subscriptions/check
+       * @secure
+       */
+      issueCheckSubscription: (owner, repo, index, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/subscriptions/check`,
+        method: "GET",
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueAddSubscription
+       * @summary Subscribe user to issue
+       * @request PUT:/repos/{owner}/{repo}/issues/{index}/subscriptions/{user}
+       * @secure
+       */
+      issueAddSubscription: (owner, repo, index, user, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/subscriptions/${user}`,
+        method: "PUT",
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueDeleteSubscription
+       * @summary Unsubscribe user from issue
+       * @request DELETE:/repos/{owner}/{repo}/issues/{index}/subscriptions/{user}
+       * @secure
+       */
+      issueDeleteSubscription: (owner, repo, index, user, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/subscriptions/${user}`,
+        method: "DELETE",
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueGetCommentsAndTimeline
+       * @summary List all comments and events on an issue
+       * @request GET:/repos/{owner}/{repo}/issues/{index}/timeline
+       * @secure
+       */
+      issueGetCommentsAndTimeline: (owner, repo, index, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/timeline`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueTrackedTimes
+       * @summary List an issue's tracked times
+       * @request GET:/repos/{owner}/{repo}/issues/{index}/times
+       * @secure
+       */
+      issueTrackedTimes: (owner, repo, index, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/times`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueAddTime
+       * @summary Add tracked time to a issue
+       * @request POST:/repos/{owner}/{repo}/issues/{index}/times
+       * @secure
+       */
+      issueAddTime: (owner, repo, index, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/times`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueResetTime
+       * @summary Reset a tracked time of an issue
+       * @request DELETE:/repos/{owner}/{repo}/issues/{index}/times
+       * @secure
+       */
+      issueResetTime: (owner, repo, index, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/times`,
+        method: "DELETE",
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueDeleteTime
+       * @summary Delete specific tracked time
+       * @request DELETE:/repos/{owner}/{repo}/issues/{index}/times/{id}
+       * @secure
+       */
+      issueDeleteTime: (owner, repo, index, id, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/issues/${index}/times/${id}`,
+        method: "DELETE",
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoListKeys
+       * @summary List a repository's keys
+       * @request GET:/repos/{owner}/{repo}/keys
+       * @secure
+       */
+      repoListKeys: (owner, repo, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/keys`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoCreateKey
+       * @summary Add a key to a repository
+       * @request POST:/repos/{owner}/{repo}/keys
+       * @secure
+       */
+      repoCreateKey: (owner, repo, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/keys`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetKey
+       * @summary Get a repository's key by id
+       * @request GET:/repos/{owner}/{repo}/keys/{id}
+       * @secure
+       */
+      repoGetKey: (owner, repo, id, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/keys/${id}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoDeleteKey
+       * @summary Delete a key from a repository
+       * @request DELETE:/repos/{owner}/{repo}/keys/{id}
+       * @secure
+       */
+      repoDeleteKey: (owner, repo, id, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/keys/${id}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueListLabels
+       * @summary Get all of a repository's labels
+       * @request GET:/repos/{owner}/{repo}/labels
+       * @secure
+       */
+      issueListLabels: (owner, repo, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/labels`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueCreateLabel
+       * @summary Create a label
+       * @request POST:/repos/{owner}/{repo}/labels
+       * @secure
+       */
+      issueCreateLabel: (owner, repo, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/labels`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueGetLabel
+       * @summary Get a single label
+       * @request GET:/repos/{owner}/{repo}/labels/{id}
+       * @secure
+       */
+      issueGetLabel: (owner, repo, id, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/labels/${id}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueDeleteLabel
+       * @summary Delete a label
+       * @request DELETE:/repos/{owner}/{repo}/labels/{id}
+       * @secure
+       */
+      issueDeleteLabel: (owner, repo, id, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/labels/${id}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueEditLabel
+       * @summary Update a label
+       * @request PATCH:/repos/{owner}/{repo}/labels/{id}
+       * @secure
+       */
+      issueEditLabel: (owner, repo, id, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/labels/${id}`,
+        method: "PATCH",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetLanguages
+       * @summary Get languages and number of bytes of code written
+       * @request GET:/repos/{owner}/{repo}/languages
+       * @secure
+       */
+      repoGetLanguages: (owner, repo, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/languages`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetLicenses
+       * @summary Get repo licenses
+       * @request GET:/repos/{owner}/{repo}/licenses
+       * @secure
+       */
+      repoGetLicenses: (owner, repo, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/licenses`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetRawFileOrLfs
+       * @summary Get a file or it's LFS object from a repository
+       * @request GET:/repos/{owner}/{repo}/media/{filepath}
+       * @secure
+       */
+      repoGetRawFileOrLfs: (owner, repo, filepath, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/media/${filepath}`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoMergeUpstream
+       * @summary Merge a branch from upstream
+       * @request POST:/repos/{owner}/{repo}/merge-upstream
+       * @secure
+       */
+      repoMergeUpstream: (owner, repo, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/merge-upstream`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueGetMilestonesList
+       * @summary Get all of a repository's opened milestones
+       * @request GET:/repos/{owner}/{repo}/milestones
+       * @secure
+       */
+      issueGetMilestonesList: (owner, repo, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/milestones`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueCreateMilestone
+       * @summary Create a milestone
+       * @request POST:/repos/{owner}/{repo}/milestones
+       * @secure
+       */
+      issueCreateMilestone: (owner, repo, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/milestones`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueGetMilestone
+       * @summary Get a milestone
+       * @request GET:/repos/{owner}/{repo}/milestones/{id}
+       * @secure
+       */
+      issueGetMilestone: (owner, repo, id, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/milestones/${id}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueDeleteMilestone
+       * @summary Delete a milestone
+       * @request DELETE:/repos/{owner}/{repo}/milestones/{id}
+       * @secure
+       */
+      issueDeleteMilestone: (owner, repo, id, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/milestones/${id}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags issue
+       * @name IssueEditMilestone
+       * @summary Update a milestone
+       * @request PATCH:/repos/{owner}/{repo}/milestones/{id}
+       * @secure
+       */
+      issueEditMilestone: (owner, repo, id, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/milestones/${id}`,
+        method: "PATCH",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoMirrorSync
+       * @summary Sync a mirrored repository
+       * @request POST:/repos/{owner}/{repo}/mirror-sync
+       * @secure
+       */
+      repoMirrorSync: (owner, repo, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/mirror-sync`,
+        method: "POST",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoNewPinAllowed
+       * @summary Returns if new Issue Pins are allowed
+       * @request GET:/repos/{owner}/{repo}/new_pin_allowed
+       * @secure
+       */
+      repoNewPinAllowed: (owner, repo, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/new_pin_allowed`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags notification
+       * @name NotifyGetRepoList
+       * @summary List users's notification threads on a specific repo
+       * @request GET:/repos/{owner}/{repo}/notifications
+       * @secure
+       */
+      notifyGetRepoList: (owner, repo, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/notifications`,
+        method: "GET",
+        query,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags notification
+       * @name NotifyReadRepoList
+       * @summary Mark notification threads as read, pinned or unread on a specific repo
+       * @request PUT:/repos/{owner}/{repo}/notifications
+       * @secure
+       */
+      notifyReadRepoList: (owner, repo, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/notifications`,
+        method: "PUT",
+        query,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoListPullRequests
+       * @summary List a repo's pull requests
+       * @request GET:/repos/{owner}/{repo}/pulls
+       * @secure
+       */
+      repoListPullRequests: (owner, repo, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/pulls`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoCreatePullRequest
+       * @summary Create a pull request
+       * @request POST:/repos/{owner}/{repo}/pulls
+       * @secure
+       */
+      repoCreatePullRequest: (owner, repo, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/pulls`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoListPinnedPullRequests
+       * @summary List a repo's pinned pull requests
+       * @request GET:/repos/{owner}/{repo}/pulls/pinned
+       * @secure
+       */
+      repoListPinnedPullRequests: (owner, repo, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/pulls/pinned`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetPullRequestByBaseHead
+       * @summary Get a pull request by base and head
+       * @request GET:/repos/{owner}/{repo}/pulls/{base}/{head}
+       * @secure
+       */
+      repoGetPullRequestByBaseHead: (owner, repo, base, head, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/pulls/${base}/${head}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetPullRequest
+       * @summary Get a pull request
+       * @request GET:/repos/{owner}/{repo}/pulls/{index}
+       * @secure
+       */
+      repoGetPullRequest: (owner, repo, index, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/pulls/${index}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoEditPullRequest
+       * @summary Update a pull request. If using deadline only the date will be taken into account, and time of day ignored.
+       * @request PATCH:/repos/{owner}/{repo}/pulls/{index}
+       * @secure
+       */
+      repoEditPullRequest: (owner, repo, index, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/pulls/${index}`,
+        method: "PATCH",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoDownloadPullDiffOrPatch
+       * @summary Get a pull request diff or patch
+       * @request GET:/repos/{owner}/{repo}/pulls/{index}.{diffType}
+       * @secure
+       */
+      repoDownloadPullDiffOrPatch: (owner, repo, index, diffType, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/pulls/${index}.${diffType}`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetPullRequestCommits
+       * @summary Get commits for a pull request
+       * @request GET:/repos/{owner}/{repo}/pulls/{index}/commits
+       * @secure
+       */
+      repoGetPullRequestCommits: (owner, repo, index, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/pulls/${index}/commits`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetPullRequestFiles
+       * @summary Get changed files for a pull request
+       * @request GET:/repos/{owner}/{repo}/pulls/{index}/files
+       * @secure
+       */
+      repoGetPullRequestFiles: (owner, repo, index, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/pulls/${index}/files`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoPullRequestIsMerged
+       * @summary Check if a pull request has been merged
+       * @request GET:/repos/{owner}/{repo}/pulls/{index}/merge
+       * @secure
+       */
+      repoPullRequestIsMerged: (owner, repo, index, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/pulls/${index}/merge`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoMergePullRequest
+       * @summary Merge a pull request
+       * @request POST:/repos/{owner}/{repo}/pulls/{index}/merge
+       * @secure
+       */
+      repoMergePullRequest: (owner, repo, index, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/pulls/${index}/merge`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoCancelScheduledAutoMerge
+       * @summary Cancel the scheduled auto merge for the given pull request
+       * @request DELETE:/repos/{owner}/{repo}/pulls/{index}/merge
+       * @secure
+       */
+      repoCancelScheduledAutoMerge: (owner, repo, index, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/pulls/${index}/merge`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoCreatePullReviewRequests
+       * @summary create review requests for a pull request
+       * @request POST:/repos/{owner}/{repo}/pulls/{index}/requested_reviewers
+       * @secure
+       */
+      repoCreatePullReviewRequests: (owner, repo, index, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/pulls/${index}/requested_reviewers`,
+        method: "POST",
+        body,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoDeletePullReviewRequests
+       * @summary cancel review requests for a pull request
+       * @request DELETE:/repos/{owner}/{repo}/pulls/{index}/requested_reviewers
+       * @secure
+       */
+      repoDeletePullReviewRequests: (owner, repo, index, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/pulls/${index}/requested_reviewers`,
+        method: "DELETE",
+        body,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoListPullReviews
+       * @summary List all reviews for a pull request
+       * @request GET:/repos/{owner}/{repo}/pulls/{index}/reviews
+       * @secure
+       */
+      repoListPullReviews: (owner, repo, index, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/pulls/${index}/reviews`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoCreatePullReview
+       * @summary Create a review to an pull request
+       * @request POST:/repos/{owner}/{repo}/pulls/{index}/reviews
+       * @secure
+       */
+      repoCreatePullReview: (owner, repo, index, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/pulls/${index}/reviews`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetPullReview
+       * @summary Get a specific review for a pull request
+       * @request GET:/repos/{owner}/{repo}/pulls/{index}/reviews/{id}
+       * @secure
+       */
+      repoGetPullReview: (owner, repo, index, id, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/pulls/${index}/reviews/${id}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoSubmitPullReview
+       * @summary Submit a pending review to an pull request
+       * @request POST:/repos/{owner}/{repo}/pulls/{index}/reviews/{id}
+       * @secure
+       */
+      repoSubmitPullReview: (owner, repo, index, id, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/pulls/${index}/reviews/${id}`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoDeletePullReview
+       * @summary Delete a specific review from a pull request
+       * @request DELETE:/repos/{owner}/{repo}/pulls/{index}/reviews/{id}
+       * @secure
+       */
+      repoDeletePullReview: (owner, repo, index, id, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/pulls/${index}/reviews/${id}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetPullReviewComments
+       * @summary Get a specific review for a pull request
+       * @request GET:/repos/{owner}/{repo}/pulls/{index}/reviews/{id}/comments
+       * @secure
+       */
+      repoGetPullReviewComments: (owner, repo, index, id, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/pulls/${index}/reviews/${id}/comments`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoDismissPullReview
+       * @summary Dismiss a review for a pull request
+       * @request POST:/repos/{owner}/{repo}/pulls/{index}/reviews/{id}/dismissals
+       * @secure
+       */
+      repoDismissPullReview: (owner, repo, index, id, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/pulls/${index}/reviews/${id}/dismissals`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoUnDismissPullReview
+       * @summary Cancel to dismiss a review for a pull request
+       * @request POST:/repos/{owner}/{repo}/pulls/{index}/reviews/{id}/undismissals
+       * @secure
+       */
+      repoUnDismissPullReview: (owner, repo, index, id, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/pulls/${index}/reviews/${id}/undismissals`,
+        method: "POST",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoUpdatePullRequest
+       * @summary Merge PR's baseBranch into headBranch
+       * @request POST:/repos/{owner}/{repo}/pulls/{index}/update
+       * @secure
+       */
+      repoUpdatePullRequest: (owner, repo, index, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/pulls/${index}/update`,
+        method: "POST",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoListPushMirrors
+       * @summary Get all push mirrors of the repository
+       * @request GET:/repos/{owner}/{repo}/push_mirrors
+       * @secure
+       */
+      repoListPushMirrors: (owner, repo, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/push_mirrors`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoAddPushMirror
+       * @summary add a push mirror to the repository
+       * @request POST:/repos/{owner}/{repo}/push_mirrors
+       * @secure
+       */
+      repoAddPushMirror: (owner, repo, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/push_mirrors`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoPushMirrorSync
+       * @summary Sync all push mirrored repository
+       * @request POST:/repos/{owner}/{repo}/push_mirrors-sync
+       * @secure
+       */
+      repoPushMirrorSync: (owner, repo, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/push_mirrors-sync`,
+        method: "POST",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetPushMirrorByRemoteName
+       * @summary Get push mirror of the repository by remoteName
+       * @request GET:/repos/{owner}/{repo}/push_mirrors/{name}
+       * @secure
+       */
+      repoGetPushMirrorByRemoteName: (owner, repo, name, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/push_mirrors/${name}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoDeletePushMirror
+       * @summary deletes a push mirror from a repository by remoteName
+       * @request DELETE:/repos/{owner}/{repo}/push_mirrors/{name}
+       * @secure
+       */
+      repoDeletePushMirror: (owner, repo, name, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/push_mirrors/${name}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetRawFile
+       * @summary Get a file from a repository
+       * @request GET:/repos/{owner}/{repo}/raw/{filepath}
+       * @secure
+       */
+      repoGetRawFile: (owner, repo, filepath, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/raw/${filepath}`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoListReleases
+       * @summary List a repo's releases
+       * @request GET:/repos/{owner}/{repo}/releases
+       * @secure
+       */
+      repoListReleases: (owner, repo, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/releases`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoCreateRelease
+       * @summary Create a release
+       * @request POST:/repos/{owner}/{repo}/releases
+       * @secure
+       */
+      repoCreateRelease: (owner, repo, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/releases`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetLatestRelease
+       * @summary Gets the most recent non-prerelease, non-draft release of a repository, sorted by created_at
+       * @request GET:/repos/{owner}/{repo}/releases/latest
+       * @secure
+       */
+      repoGetLatestRelease: (owner, repo, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/releases/latest`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetReleaseByTag
+       * @summary Get a release by tag name
+       * @request GET:/repos/{owner}/{repo}/releases/tags/{tag}
+       * @secure
+       */
+      repoGetReleaseByTag: (owner, repo, tag, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/releases/tags/${tag}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoDeleteReleaseByTag
+       * @summary Delete a release by tag name
+       * @request DELETE:/repos/{owner}/{repo}/releases/tags/{tag}
+       * @secure
+       */
+      repoDeleteReleaseByTag: (owner, repo, tag, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/releases/tags/${tag}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetRelease
+       * @summary Get a release
+       * @request GET:/repos/{owner}/{repo}/releases/{id}
+       * @secure
+       */
+      repoGetRelease: (owner, repo, id, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/releases/${id}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoDeleteRelease
+       * @summary Delete a release
+       * @request DELETE:/repos/{owner}/{repo}/releases/{id}
+       * @secure
+       */
+      repoDeleteRelease: (owner, repo, id, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/releases/${id}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoEditRelease
+       * @summary Update a release
+       * @request PATCH:/repos/{owner}/{repo}/releases/{id}
+       * @secure
+       */
+      repoEditRelease: (owner, repo, id, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/releases/${id}`,
+        method: "PATCH",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoListReleaseAttachments
+       * @summary List release's attachments
+       * @request GET:/repos/{owner}/{repo}/releases/{id}/assets
+       * @secure
+       */
+      repoListReleaseAttachments: (owner, repo, id, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/releases/${id}/assets`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoCreateReleaseAttachment
+       * @summary Create a release attachment
+       * @request POST:/repos/{owner}/{repo}/releases/{id}/assets
+       * @secure
+       */
+      repoCreateReleaseAttachment: (owner, repo, id, data, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/releases/${id}/assets`,
+        method: "POST",
+        query,
+        body: data,
+        secure: true,
+        type: "multipart/form-data" /* FormData */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetReleaseAttachment
+       * @summary Get a release attachment
+       * @request GET:/repos/{owner}/{repo}/releases/{id}/assets/{attachment_id}
+       * @secure
+       */
+      repoGetReleaseAttachment: (owner, repo, id, attachmentId, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/releases/${id}/assets/${attachmentId}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoDeleteReleaseAttachment
+       * @summary Delete a release attachment
+       * @request DELETE:/repos/{owner}/{repo}/releases/{id}/assets/{attachment_id}
+       * @secure
+       */
+      repoDeleteReleaseAttachment: (owner, repo, id, attachmentId, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/releases/${id}/assets/${attachmentId}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoEditReleaseAttachment
+       * @summary Edit a release attachment
+       * @request PATCH:/repos/{owner}/{repo}/releases/{id}/assets/{attachment_id}
+       * @secure
+       */
+      repoEditReleaseAttachment: (owner, repo, id, attachmentId, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/releases/${id}/assets/${attachmentId}`,
+        method: "PATCH",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetReviewers
+       * @summary Return all users that can be requested to review in this repo
+       * @request GET:/repos/{owner}/{repo}/reviewers
+       * @secure
+       */
+      repoGetReviewers: (owner, repo, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/reviewers`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoSigningKey
+       * @summary Get signing-key.gpg for given repository
+       * @request GET:/repos/{owner}/{repo}/signing-key.gpg
+       * @secure
+       */
+      repoSigningKey: (owner, repo, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/signing-key.gpg`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoListStargazers
+       * @summary List a repo's stargazers
+       * @request GET:/repos/{owner}/{repo}/stargazers
+       * @secure
+       */
+      repoListStargazers: (owner, repo, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/stargazers`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoListStatuses
+       * @summary Get a commit's statuses
+       * @request GET:/repos/{owner}/{repo}/statuses/{sha}
+       * @secure
+       */
+      repoListStatuses: (owner, repo, sha, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/statuses/${sha}`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoCreateStatus
+       * @summary Create a commit status
+       * @request POST:/repos/{owner}/{repo}/statuses/{sha}
+       * @secure
+       */
+      repoCreateStatus: (owner, repo, sha, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/statuses/${sha}`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoListSubscribers
+       * @summary List a repo's watchers
+       * @request GET:/repos/{owner}/{repo}/subscribers
+       * @secure
+       */
+      repoListSubscribers: (owner, repo, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/subscribers`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name UserCurrentCheckSubscription
+       * @summary Check if the current user is watching a repo
+       * @request GET:/repos/{owner}/{repo}/subscription
+       * @secure
+       */
+      userCurrentCheckSubscription: (owner, repo, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/subscription`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name UserCurrentPutSubscription
+       * @summary Watch a repo
+       * @request PUT:/repos/{owner}/{repo}/subscription
+       * @secure
+       */
+      userCurrentPutSubscription: (owner, repo, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/subscription`,
+        method: "PUT",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name UserCurrentDeleteSubscription
+       * @summary Unwatch a repo
+       * @request DELETE:/repos/{owner}/{repo}/subscription
+       * @secure
+       */
+      userCurrentDeleteSubscription: (owner, repo, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/subscription`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoListTagProtection
+       * @summary List tag protections for a repository
+       * @request GET:/repos/{owner}/{repo}/tag_protections
+       * @secure
+       */
+      repoListTagProtection: (owner, repo, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/tag_protections`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoCreateTagProtection
+       * @summary Create a tag protections for a repository
+       * @request POST:/repos/{owner}/{repo}/tag_protections
+       * @secure
+       */
+      repoCreateTagProtection: (owner, repo, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/tag_protections`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetTagProtection
+       * @summary Get a specific tag protection for the repository
+       * @request GET:/repos/{owner}/{repo}/tag_protections/{id}
+       * @secure
+       */
+      repoGetTagProtection: (owner, repo, id, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/tag_protections/${id}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoDeleteTagProtection
+       * @summary Delete a specific tag protection for the repository
+       * @request DELETE:/repos/{owner}/{repo}/tag_protections/{id}
+       * @secure
+       */
+      repoDeleteTagProtection: (owner, repo, id, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/tag_protections/${id}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoEditTagProtection
+       * @summary Edit a tag protections for a repository. Only fields that are set will be changed
+       * @request PATCH:/repos/{owner}/{repo}/tag_protections/{id}
+       * @secure
+       */
+      repoEditTagProtection: (owner, repo, id, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/tag_protections/${id}`,
+        method: "PATCH",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoListTags
+       * @summary List a repository's tags
+       * @request GET:/repos/{owner}/{repo}/tags
+       * @secure
+       */
+      repoListTags: (owner, repo, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/tags`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoCreateTag
+       * @summary Create a new git tag in a repository
+       * @request POST:/repos/{owner}/{repo}/tags
+       * @secure
+       */
+      repoCreateTag: (owner, repo, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/tags`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetTag
+       * @summary Get the tag of a repository by tag name
+       * @request GET:/repos/{owner}/{repo}/tags/{tag}
+       * @secure
+       */
+      repoGetTag: (owner, repo, tag, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/tags/${tag}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoDeleteTag
+       * @summary Delete a repository's tag by name
+       * @request DELETE:/repos/{owner}/{repo}/tags/{tag}
+       * @secure
+       */
+      repoDeleteTag: (owner, repo, tag, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/tags/${tag}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoListTeams
+       * @summary List a repository's teams
+       * @request GET:/repos/{owner}/{repo}/teams
+       * @secure
+       */
+      repoListTeams: (owner, repo, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/teams`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoCheckTeam
+       * @summary Check if a team is assigned to a repository
+       * @request GET:/repos/{owner}/{repo}/teams/{team}
+       * @secure
+       */
+      repoCheckTeam: (owner, repo, team, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/teams/${team}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoAddTeam
+       * @summary Add a team to a repository
+       * @request PUT:/repos/{owner}/{repo}/teams/{team}
+       * @secure
+       */
+      repoAddTeam: (owner, repo, team, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/teams/${team}`,
+        method: "PUT",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoDeleteTeam
+       * @summary Delete a team from a repository
+       * @request DELETE:/repos/{owner}/{repo}/teams/{team}
+       * @secure
+       */
+      repoDeleteTeam: (owner, repo, team, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/teams/${team}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoTrackedTimes
+       * @summary List a repo's tracked times
+       * @request GET:/repos/{owner}/{repo}/times
+       * @secure
+       */
+      repoTrackedTimes: (owner, repo, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/times`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name UserTrackedTimes
+       * @summary List a user's tracked times in a repo
+       * @request GET:/repos/{owner}/{repo}/times/{user}
+       * @deprecated
+       * @secure
+       */
+      userTrackedTimes: (owner, repo, user, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/times/${user}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoListTopics
+       * @summary Get list of topics that a repository has
+       * @request GET:/repos/{owner}/{repo}/topics
+       * @secure
+       */
+      repoListTopics: (owner, repo, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/topics`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoUpdateTopics
+       * @summary Replace list of topics for a repository
+       * @request PUT:/repos/{owner}/{repo}/topics
+       * @secure
+       */
+      repoUpdateTopics: (owner, repo, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/topics`,
+        method: "PUT",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoAddTopic
+       * @summary Add a topic to a repository
+       * @request PUT:/repos/{owner}/{repo}/topics/{topic}
+       * @secure
+       */
+      repoAddTopic: (owner, repo, topic, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/topics/${topic}`,
+        method: "PUT",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoDeleteTopic
+       * @summary Delete a topic from a repository
+       * @request DELETE:/repos/{owner}/{repo}/topics/{topic}
+       * @secure
+       */
+      repoDeleteTopic: (owner, repo, topic, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/topics/${topic}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoTransfer
+       * @summary Transfer a repo ownership
+       * @request POST:/repos/{owner}/{repo}/transfer
+       * @secure
+       */
+      repoTransfer: (owner, repo, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/transfer`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name AcceptRepoTransfer
+       * @summary Accept a repo transfer
+       * @request POST:/repos/{owner}/{repo}/transfer/accept
+       * @secure
+       */
+      acceptRepoTransfer: (owner, repo, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/transfer/accept`,
+        method: "POST",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RejectRepoTransfer
+       * @summary Reject a repo transfer
+       * @request POST:/repos/{owner}/{repo}/transfer/reject
+       * @secure
+       */
+      rejectRepoTransfer: (owner, repo, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/transfer/reject`,
+        method: "POST",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoCreateWikiPage
+       * @summary Create a wiki page
+       * @request POST:/repos/{owner}/{repo}/wiki/new
+       * @secure
+       */
+      repoCreateWikiPage: (owner, repo, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/wiki/new`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetWikiPage
+       * @summary Get a wiki page
+       * @request GET:/repos/{owner}/{repo}/wiki/page/{pageName}
+       * @secure
+       */
+      repoGetWikiPage: (owner, repo, pageName, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/wiki/page/${pageName}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoDeleteWikiPage
+       * @summary Delete a wiki page
+       * @request DELETE:/repos/{owner}/{repo}/wiki/page/{pageName}
+       * @secure
+       */
+      repoDeleteWikiPage: (owner, repo, pageName, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/wiki/page/${pageName}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoEditWikiPage
+       * @summary Edit a wiki page
+       * @request PATCH:/repos/{owner}/{repo}/wiki/page/{pageName}
+       * @secure
+       */
+      repoEditWikiPage: (owner, repo, pageName, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/wiki/page/${pageName}`,
+        method: "PATCH",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetWikiPages
+       * @summary Get all wiki pages
+       * @request GET:/repos/{owner}/{repo}/wiki/pages
+       * @secure
+       */
+      repoGetWikiPages: (owner, repo, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/wiki/pages`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetWikiPageRevisions
+       * @summary Get revisions of a wiki page
+       * @request GET:/repos/{owner}/{repo}/wiki/revisions/{pageName}
+       * @secure
+       */
+      repoGetWikiPageRevisions: (owner, repo, pageName, query, params = {}) => this.request(__spreadValues({
+        path: `/repos/${owner}/${repo}/wiki/revisions/${pageName}`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name GenerateRepo
+       * @summary Create a repository using a template
+       * @request POST:/repos/{template_owner}/{template_repo}/generate
+       * @secure
+       */
+      generateRepo: (templateOwner, templateRepo, body, params = {}) => this.request(__spreadValues({
+        path: `/repos/${templateOwner}/${templateRepo}/generate`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params))
+    };
+    this.repositories = {
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name RepoGetById
+       * @summary Get a repository by id
+       * @request GET:/repositories/{id}
+       * @secure
+       */
+      repoGetById: (id, params = {}) => this.request(__spreadValues({
+        path: `/repositories/${id}`,
+        method: "GET",
+        secure: true
+      }, params))
+    };
+    this.settings = {
+      /**
+       * No description
+       *
+       * @tags settings
+       * @name GetGeneralApiSettings
+       * @summary Get instance's global settings for api
+       * @request GET:/settings/api
+       * @secure
+       */
+      getGeneralApiSettings: (params = {}) => this.request(__spreadValues({
+        path: `/settings/api`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags settings
+       * @name GetGeneralAttachmentSettings
+       * @summary Get instance's global settings for Attachment
+       * @request GET:/settings/attachment
+       * @secure
+       */
+      getGeneralAttachmentSettings: (params = {}) => this.request(__spreadValues({
+        path: `/settings/attachment`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags settings
+       * @name GetGeneralRepositorySettings
+       * @summary Get instance's global settings for repositories
+       * @request GET:/settings/repository
+       * @secure
+       */
+      getGeneralRepositorySettings: (params = {}) => this.request(__spreadValues({
+        path: `/settings/repository`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags settings
+       * @name GetGeneralUiSettings
+       * @summary Get instance's global settings for ui
+       * @request GET:/settings/ui
+       * @secure
+       */
+      getGeneralUiSettings: (params = {}) => this.request(__spreadValues({
+        path: `/settings/ui`,
+        method: "GET",
+        secure: true
+      }, params))
+    };
+    this.signingKeyGpg = {
+      /**
+       * No description
+       *
+       * @tags miscellaneous
+       * @name GetSigningKey
+       * @summary Get default signing-key.gpg
+       * @request GET:/signing-key.gpg
+       * @secure
+       */
+      getSigningKey: (params = {}) => this.request(__spreadValues({
+        path: `/signing-key.gpg`,
+        method: "GET",
+        secure: true
+      }, params))
+    };
+    this.teams = {
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgGetTeam
+       * @summary Get a team
+       * @request GET:/teams/{id}
+       * @secure
+       */
+      orgGetTeam: (id, params = {}) => this.request(__spreadValues({
+        path: `/teams/${id}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgDeleteTeam
+       * @summary Delete a team
+       * @request DELETE:/teams/{id}
+       * @secure
+       */
+      orgDeleteTeam: (id, params = {}) => this.request(__spreadValues({
+        path: `/teams/${id}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgEditTeam
+       * @summary Edit a team
+       * @request PATCH:/teams/{id}
+       * @secure
+       */
+      orgEditTeam: (id, body, params = {}) => this.request(__spreadValues({
+        path: `/teams/${id}`,
+        method: "PATCH",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgListTeamActivityFeeds
+       * @summary List a team's activity feeds
+       * @request GET:/teams/{id}/activities/feeds
+       * @secure
+       */
+      orgListTeamActivityFeeds: (id, query, params = {}) => this.request(__spreadValues({
+        path: `/teams/${id}/activities/feeds`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgListTeamMembers
+       * @summary List a team's members
+       * @request GET:/teams/{id}/members
+       * @secure
+       */
+      orgListTeamMembers: (id, query, params = {}) => this.request(__spreadValues({
+        path: `/teams/${id}/members`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgListTeamMember
+       * @summary List a particular member of team
+       * @request GET:/teams/{id}/members/{username}
+       * @secure
+       */
+      orgListTeamMember: (id, username, params = {}) => this.request(__spreadValues({
+        path: `/teams/${id}/members/${username}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgAddTeamMember
+       * @summary Add a team member
+       * @request PUT:/teams/{id}/members/{username}
+       * @secure
+       */
+      orgAddTeamMember: (id, username, params = {}) => this.request(__spreadValues({
+        path: `/teams/${id}/members/${username}`,
+        method: "PUT",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgRemoveTeamMember
+       * @summary Remove a team member
+       * @request DELETE:/teams/{id}/members/{username}
+       * @secure
+       */
+      orgRemoveTeamMember: (id, username, params = {}) => this.request(__spreadValues({
+        path: `/teams/${id}/members/${username}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgListTeamRepos
+       * @summary List a team's repos
+       * @request GET:/teams/{id}/repos
+       * @secure
+       */
+      orgListTeamRepos: (id, query, params = {}) => this.request(__spreadValues({
+        path: `/teams/${id}/repos`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgListTeamRepo
+       * @summary List a particular repo of team
+       * @request GET:/teams/{id}/repos/{org}/{repo}
+       * @secure
+       */
+      orgListTeamRepo: (id, org, repo, params = {}) => this.request(__spreadValues({
+        path: `/teams/${id}/repos/${org}/${repo}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgAddTeamRepository
+       * @summary Add a repository to a team
+       * @request PUT:/teams/{id}/repos/{org}/{repo}
+       * @secure
+       */
+      orgAddTeamRepository: (id, org, repo, params = {}) => this.request(__spreadValues({
+        path: `/teams/${id}/repos/${org}/${repo}`,
+        method: "PUT",
+        secure: true
+      }, params)),
+      /**
+       * @description This does not delete the repository, it only removes the repository from the team.
+       *
+       * @tags organization
+       * @name OrgRemoveTeamRepository
+       * @summary Remove a repository from a team
+       * @request DELETE:/teams/{id}/repos/{org}/{repo}
+       * @secure
+       */
+      orgRemoveTeamRepository: (id, org, repo, params = {}) => this.request(__spreadValues({
+        path: `/teams/${id}/repos/${org}/${repo}`,
+        method: "DELETE",
+        secure: true
+      }, params))
+    };
+    this.topics = {
+      /**
+       * No description
+       *
+       * @tags repository
+       * @name TopicSearch
+       * @summary search topics via keyword
+       * @request GET:/topics/search
+       * @secure
+       */
+      topicSearch: (query, params = {}) => this.request(__spreadValues({
+        path: `/topics/search`,
+        method: "GET",
+        query,
+        secure: true
+      }, params))
+    };
+    this.user = {
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserGetCurrent
+       * @summary Get the authenticated user
+       * @request GET:/user
+       * @secure
+       */
+      userGetCurrent: (params = {}) => this.request(__spreadValues({
+        path: `/user`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserGetRunnerRegistrationToken
+       * @summary Get an user's actions runner registration token
+       * @request GET:/user/actions/runners/registration-token
+       * @secure
+       */
+      userGetRunnerRegistrationToken: (params = {}) => this.request(__spreadValues({
+        path: `/user/actions/runners/registration-token`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UpdateUserSecret
+       * @summary Create or Update a secret value in a user scope
+       * @request PUT:/user/actions/secrets/{secretname}
+       * @secure
+       */
+      updateUserSecret: (secretname, body, params = {}) => this.request(__spreadValues({
+        path: `/user/actions/secrets/${secretname}`,
+        method: "PUT",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name DeleteUserSecret
+       * @summary Delete a secret in a user scope
+       * @request DELETE:/user/actions/secrets/{secretname}
+       * @secure
+       */
+      deleteUserSecret: (secretname, params = {}) => this.request(__spreadValues({
+        path: `/user/actions/secrets/${secretname}`,
+        method: "DELETE",
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name GetUserVariablesList
+       * @summary Get the user-level list of variables which is created by current doer
+       * @request GET:/user/actions/variables
+       * @secure
+       */
+      getUserVariablesList: (query, params = {}) => this.request(__spreadValues({
+        path: `/user/actions/variables`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name GetUserVariable
+       * @summary Get a user-level variable which is created by current doer
+       * @request GET:/user/actions/variables/{variablename}
+       * @secure
+       */
+      getUserVariable: (variablename, params = {}) => this.request(__spreadValues({
+        path: `/user/actions/variables/${variablename}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UpdateUserVariable
+       * @summary Update a user-level variable which is created by current doer
+       * @request PUT:/user/actions/variables/{variablename}
+       * @secure
+       */
+      updateUserVariable: (variablename, body, params = {}) => this.request(__spreadValues({
+        path: `/user/actions/variables/${variablename}`,
+        method: "PUT",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name CreateUserVariable
+       * @summary Create a user-level variable
+       * @request POST:/user/actions/variables/{variablename}
+       * @secure
+       */
+      createUserVariable: (variablename, body, params = {}) => this.request(__spreadValues({
+        path: `/user/actions/variables/${variablename}`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name DeleteUserVariable
+       * @summary Delete a user-level variable which is created by current doer
+       * @request DELETE:/user/actions/variables/{variablename}
+       * @secure
+       */
+      deleteUserVariable: (variablename, params = {}) => this.request(__spreadValues({
+        path: `/user/actions/variables/${variablename}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserGetOauth2Application
+       * @summary List the authenticated user's oauth2 applications
+       * @request GET:/user/applications/oauth2
+       * @secure
+       */
+      userGetOauth2Application: (query, params = {}) => this.request(__spreadValues({
+        path: `/user/applications/oauth2`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserCreateOAuth2Application
+       * @summary creates a new OAuth2 application
+       * @request POST:/user/applications/oauth2
+       * @secure
+       */
+      userCreateOAuth2Application: (body, params = {}) => this.request(__spreadValues({
+        path: `/user/applications/oauth2`,
+        method: "POST",
+        body,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserGetOAuth2Application
+       * @summary get an OAuth2 Application
+       * @request GET:/user/applications/oauth2/{id}
+       * @secure
+       */
+      userGetOAuth2Application: (id, params = {}) => this.request(__spreadValues({
+        path: `/user/applications/oauth2/${id}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserDeleteOAuth2Application
+       * @summary delete an OAuth2 Application
+       * @request DELETE:/user/applications/oauth2/{id}
+       * @secure
+       */
+      userDeleteOAuth2Application: (id, params = {}) => this.request(__spreadValues({
+        path: `/user/applications/oauth2/${id}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserUpdateOAuth2Application
+       * @summary update an OAuth2 Application, this includes regenerating the client secret
+       * @request PATCH:/user/applications/oauth2/{id}
+       * @secure
+       */
+      userUpdateOAuth2Application: (id, body, params = {}) => this.request(__spreadValues({
+        path: `/user/applications/oauth2/${id}`,
+        method: "PATCH",
+        body,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserUpdateAvatar
+       * @summary Update Avatar
+       * @request POST:/user/avatar
+       * @secure
+       */
+      userUpdateAvatar: (body, params = {}) => this.request(__spreadValues({
+        path: `/user/avatar`,
+        method: "POST",
+        body,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserDeleteAvatar
+       * @summary Delete Avatar
+       * @request DELETE:/user/avatar
+       * @secure
+       */
+      userDeleteAvatar: (params = {}) => this.request(__spreadValues({
+        path: `/user/avatar`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserListBlocks
+       * @summary List users blocked by the authenticated user
+       * @request GET:/user/blocks
+       * @secure
+       */
+      userListBlocks: (query, params = {}) => this.request(__spreadValues({
+        path: `/user/blocks`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserCheckUserBlock
+       * @summary Check if a user is blocked by the authenticated user
+       * @request GET:/user/blocks/{username}
+       * @secure
+       */
+      userCheckUserBlock: (username, params = {}) => this.request(__spreadValues({
+        path: `/user/blocks/${username}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserBlockUser
+       * @summary Block a user
+       * @request PUT:/user/blocks/{username}
+       * @secure
+       */
+      userBlockUser: (username, query, params = {}) => this.request(__spreadValues({
+        path: `/user/blocks/${username}`,
+        method: "PUT",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserUnblockUser
+       * @summary Unblock a user
+       * @request DELETE:/user/blocks/{username}
+       * @secure
+       */
+      userUnblockUser: (username, params = {}) => this.request(__spreadValues({
+        path: `/user/blocks/${username}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserListEmails
+       * @summary List the authenticated user's email addresses
+       * @request GET:/user/emails
+       * @secure
+       */
+      userListEmails: (params = {}) => this.request(__spreadValues({
+        path: `/user/emails`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserAddEmail
+       * @summary Add email addresses
+       * @request POST:/user/emails
+       * @secure
+       */
+      userAddEmail: (body, params = {}) => this.request(__spreadValues({
+        path: `/user/emails`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserDeleteEmail
+       * @summary Delete email addresses
+       * @request DELETE:/user/emails
+       * @secure
+       */
+      userDeleteEmail: (body, params = {}) => this.request(__spreadValues({
+        path: `/user/emails`,
+        method: "DELETE",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserCurrentListFollowers
+       * @summary List the authenticated user's followers
+       * @request GET:/user/followers
+       * @secure
+       */
+      userCurrentListFollowers: (query, params = {}) => this.request(__spreadValues({
+        path: `/user/followers`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserCurrentListFollowing
+       * @summary List the users that the authenticated user is following
+       * @request GET:/user/following
+       * @secure
+       */
+      userCurrentListFollowing: (query, params = {}) => this.request(__spreadValues({
+        path: `/user/following`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserCurrentCheckFollowing
+       * @summary Check whether a user is followed by the authenticated user
+       * @request GET:/user/following/{username}
+       * @secure
+       */
+      userCurrentCheckFollowing: (username, params = {}) => this.request(__spreadValues({
+        path: `/user/following/${username}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserCurrentPutFollow
+       * @summary Follow a user
+       * @request PUT:/user/following/{username}
+       * @secure
+       */
+      userCurrentPutFollow: (username, params = {}) => this.request(__spreadValues({
+        path: `/user/following/${username}`,
+        method: "PUT",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserCurrentDeleteFollow
+       * @summary Unfollow a user
+       * @request DELETE:/user/following/{username}
+       * @secure
+       */
+      userCurrentDeleteFollow: (username, params = {}) => this.request(__spreadValues({
+        path: `/user/following/${username}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name GetVerificationToken
+       * @summary Get a Token to verify
+       * @request GET:/user/gpg_key_token
+       * @secure
+       */
+      getVerificationToken: (params = {}) => this.request(__spreadValues({
+        path: `/user/gpg_key_token`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserVerifyGpgKey
+       * @summary Verify a GPG key
+       * @request POST:/user/gpg_key_verify
+       * @secure
+       */
+      userVerifyGpgKey: (params = {}) => this.request(__spreadValues({
+        path: `/user/gpg_key_verify`,
+        method: "POST",
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserCurrentListGpgKeys
+       * @summary List the authenticated user's GPG keys
+       * @request GET:/user/gpg_keys
+       * @secure
+       */
+      userCurrentListGpgKeys: (query, params = {}) => this.request(__spreadValues({
+        path: `/user/gpg_keys`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserCurrentPostGpgKey
+       * @summary Create a GPG key
+       * @request POST:/user/gpg_keys
+       * @secure
+       */
+      userCurrentPostGpgKey: (Form, params = {}) => this.request(__spreadValues({
+        path: `/user/gpg_keys`,
+        method: "POST",
+        body: Form,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserCurrentGetGpgKey
+       * @summary Get a GPG key
+       * @request GET:/user/gpg_keys/{id}
+       * @secure
+       */
+      userCurrentGetGpgKey: (id, params = {}) => this.request(__spreadValues({
+        path: `/user/gpg_keys/${id}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserCurrentDeleteGpgKey
+       * @summary Remove a GPG key
+       * @request DELETE:/user/gpg_keys/{id}
+       * @secure
+       */
+      userCurrentDeleteGpgKey: (id, params = {}) => this.request(__spreadValues({
+        path: `/user/gpg_keys/${id}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserListHooks
+       * @summary List the authenticated user's webhooks
+       * @request GET:/user/hooks
+       * @secure
+       */
+      userListHooks: (query, params = {}) => this.request(__spreadValues({
+        path: `/user/hooks`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserCreateHook
+       * @summary Create a hook
+       * @request POST:/user/hooks
+       * @secure
+       */
+      userCreateHook: (body, params = {}) => this.request(__spreadValues({
+        path: `/user/hooks`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserGetHook
+       * @summary Get a hook
+       * @request GET:/user/hooks/{id}
+       * @secure
+       */
+      userGetHook: (id, params = {}) => this.request(__spreadValues({
+        path: `/user/hooks/${id}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserDeleteHook
+       * @summary Delete a hook
+       * @request DELETE:/user/hooks/{id}
+       * @secure
+       */
+      userDeleteHook: (id, params = {}) => this.request(__spreadValues({
+        path: `/user/hooks/${id}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserEditHook
+       * @summary Update a hook
+       * @request PATCH:/user/hooks/{id}
+       * @secure
+       */
+      userEditHook: (id, body, params = {}) => this.request(__spreadValues({
+        path: `/user/hooks/${id}`,
+        method: "PATCH",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserCurrentListKeys
+       * @summary List the authenticated user's public keys
+       * @request GET:/user/keys
+       * @secure
+       */
+      userCurrentListKeys: (query, params = {}) => this.request(__spreadValues({
+        path: `/user/keys`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserCurrentPostKey
+       * @summary Create a public key
+       * @request POST:/user/keys
+       * @secure
+       */
+      userCurrentPostKey: (body, params = {}) => this.request(__spreadValues({
+        path: `/user/keys`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserCurrentGetKey
+       * @summary Get a public key
+       * @request GET:/user/keys/{id}
+       * @secure
+       */
+      userCurrentGetKey: (id, params = {}) => this.request(__spreadValues({
+        path: `/user/keys/${id}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserCurrentDeleteKey
+       * @summary Delete a public key
+       * @request DELETE:/user/keys/{id}
+       * @secure
+       */
+      userCurrentDeleteKey: (id, params = {}) => this.request(__spreadValues({
+        path: `/user/keys/${id}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgListCurrentUserOrgs
+       * @summary List the current user's organizations
+       * @request GET:/user/orgs
+       * @secure
+       */
+      orgListCurrentUserOrgs: (query, params = {}) => this.request(__spreadValues({
+        path: `/user/orgs`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserCurrentListRepos
+       * @summary List the repos that the authenticated user owns
+       * @request GET:/user/repos
+       * @secure
+       */
+      userCurrentListRepos: (query, params = {}) => this.request(__spreadValues({
+        path: `/user/repos`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags repository, user
+       * @name CreateCurrentUserRepo
+       * @summary Create a repository
+       * @request POST:/user/repos
+       * @secure
+       */
+      createCurrentUserRepo: (body, params = {}) => this.request(__spreadValues({
+        path: `/user/repos`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name GetUserSettings
+       * @summary Get user settings
+       * @request GET:/user/settings
+       * @secure
+       */
+      getUserSettings: (params = {}) => this.request(__spreadValues({
+        path: `/user/settings`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UpdateUserSettings
+       * @summary Update user settings
+       * @request PATCH:/user/settings
+       * @secure
+       */
+      updateUserSettings: (body, params = {}) => this.request(__spreadValues({
+        path: `/user/settings`,
+        method: "PATCH",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserCurrentListStarred
+       * @summary The repos that the authenticated user has starred
+       * @request GET:/user/starred
+       * @secure
+       */
+      userCurrentListStarred: (query, params = {}) => this.request(__spreadValues({
+        path: `/user/starred`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserCurrentCheckStarring
+       * @summary Whether the authenticated is starring the repo
+       * @request GET:/user/starred/{owner}/{repo}
+       * @secure
+       */
+      userCurrentCheckStarring: (owner, repo, params = {}) => this.request(__spreadValues({
+        path: `/user/starred/${owner}/${repo}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserCurrentPutStar
+       * @summary Star the given repo
+       * @request PUT:/user/starred/{owner}/{repo}
+       * @secure
+       */
+      userCurrentPutStar: (owner, repo, params = {}) => this.request(__spreadValues({
+        path: `/user/starred/${owner}/${repo}`,
+        method: "PUT",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserCurrentDeleteStar
+       * @summary Unstar the given repo
+       * @request DELETE:/user/starred/{owner}/{repo}
+       * @secure
+       */
+      userCurrentDeleteStar: (owner, repo, params = {}) => this.request(__spreadValues({
+        path: `/user/starred/${owner}/${repo}`,
+        method: "DELETE",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserGetStopWatches
+       * @summary Get list of all existing stopwatches
+       * @request GET:/user/stopwatches
+       * @secure
+       */
+      userGetStopWatches: (query, params = {}) => this.request(__spreadValues({
+        path: `/user/stopwatches`,
+        method: "GET",
+        query,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserCurrentListSubscriptions
+       * @summary List repositories watched by the authenticated user
+       * @request GET:/user/subscriptions
+       * @secure
+       */
+      userCurrentListSubscriptions: (query, params = {}) => this.request(__spreadValues({
+        path: `/user/subscriptions`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserListTeams
+       * @summary List all the teams a user belongs to
+       * @request GET:/user/teams
+       * @secure
+       */
+      userListTeams: (query, params = {}) => this.request(__spreadValues({
+        path: `/user/teams`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserCurrentTrackedTimes
+       * @summary List the current user's tracked times
+       * @request GET:/user/times
+       * @secure
+       */
+      userCurrentTrackedTimes: (query, params = {}) => this.request(__spreadValues({
+        path: `/user/times`,
+        method: "GET",
+        query,
+        secure: true
+      }, params))
+    };
+    this.users = {
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserSearch
+       * @summary Search for users
+       * @request GET:/users/search
+       * @secure
+       */
+      userSearch: (query, params = {}) => this.request(__spreadValues({
+        path: `/users/search`,
+        method: "GET",
+        query,
+        secure: true,
+        format: "json"
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserGet
+       * @summary Get a user
+       * @request GET:/users/{username}
+       * @secure
+       */
+      userGet: (username, params = {}) => this.request(__spreadValues({
+        path: `/users/${username}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserListActivityFeeds
+       * @summary List a user's activity feeds
+       * @request GET:/users/{username}/activities/feeds
+       * @secure
+       */
+      userListActivityFeeds: (username, query, params = {}) => this.request(__spreadValues({
+        path: `/users/${username}/activities/feeds`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserListFollowers
+       * @summary List the given user's followers
+       * @request GET:/users/{username}/followers
+       * @secure
+       */
+      userListFollowers: (username, query, params = {}) => this.request(__spreadValues({
+        path: `/users/${username}/followers`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserListFollowing
+       * @summary List the users that the given user is following
+       * @request GET:/users/{username}/following
+       * @secure
+       */
+      userListFollowing: (username, query, params = {}) => this.request(__spreadValues({
+        path: `/users/${username}/following`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserCheckFollowing
+       * @summary Check if one user is following another user
+       * @request GET:/users/{username}/following/{target}
+       * @secure
+       */
+      userCheckFollowing: (username, target, params = {}) => this.request(__spreadValues({
+        path: `/users/${username}/following/${target}`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserListGpgKeys
+       * @summary List the given user's GPG keys
+       * @request GET:/users/{username}/gpg_keys
+       * @secure
+       */
+      userListGpgKeys: (username, query, params = {}) => this.request(__spreadValues({
+        path: `/users/${username}/gpg_keys`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserGetHeatmapData
+       * @summary Get a user's heatmap
+       * @request GET:/users/{username}/heatmap
+       * @secure
+       */
+      userGetHeatmapData: (username, params = {}) => this.request(__spreadValues({
+        path: `/users/${username}/heatmap`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserListKeys
+       * @summary List the given user's public keys
+       * @request GET:/users/{username}/keys
+       * @secure
+       */
+      userListKeys: (username, query, params = {}) => this.request(__spreadValues({
+        path: `/users/${username}/keys`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgListUserOrgs
+       * @summary List a user's organizations
+       * @request GET:/users/{username}/orgs
+       * @secure
+       */
+      orgListUserOrgs: (username, query, params = {}) => this.request(__spreadValues({
+        path: `/users/${username}/orgs`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags organization
+       * @name OrgGetUserPermissions
+       * @summary Get user permissions in organization
+       * @request GET:/users/{username}/orgs/{org}/permissions
+       * @secure
+       */
+      orgGetUserPermissions: (username, org, params = {}) => this.request(__spreadValues({
+        path: `/users/${username}/orgs/${org}/permissions`,
+        method: "GET",
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserListRepos
+       * @summary List the repos owned by the given user
+       * @request GET:/users/{username}/repos
+       * @secure
+       */
+      userListRepos: (username, query, params = {}) => this.request(__spreadValues({
+        path: `/users/${username}/repos`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserListStarred
+       * @summary The repos that the given user has starred
+       * @request GET:/users/{username}/starred
+       * @secure
+       */
+      userListStarred: (username, query, params = {}) => this.request(__spreadValues({
+        path: `/users/${username}/starred`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserListSubscriptions
+       * @summary List the repositories watched by a user
+       * @request GET:/users/{username}/subscriptions
+       * @secure
+       */
+      userListSubscriptions: (username, query, params = {}) => this.request(__spreadValues({
+        path: `/users/${username}/subscriptions`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserGetTokens
+       * @summary List the authenticated user's access tokens
+       * @request GET:/users/{username}/tokens
+       * @secure
+       */
+      userGetTokens: (username, query, params = {}) => this.request(__spreadValues({
+        path: `/users/${username}/tokens`,
+        method: "GET",
+        query,
+        secure: true
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserCreateToken
+       * @summary Create an access token
+       * @request POST:/users/{username}/tokens
+       * @secure
+       */
+      userCreateToken: (username, body, params = {}) => this.request(__spreadValues({
+        path: `/users/${username}/tokens`,
+        method: "POST",
+        body,
+        secure: true,
+        type: "application/json" /* Json */
+      }, params)),
+      /**
+       * No description
+       *
+       * @tags user
+       * @name UserDeleteAccessToken
+       * @summary delete an access token
+       * @request DELETE:/users/{username}/tokens/{token}
+       * @secure
+       */
+      userDeleteAccessToken: (username, token, params = {}) => this.request(__spreadValues({
+        path: `/users/${username}/tokens/${token}`,
+        method: "DELETE",
+        secure: true
+      }, params))
+    };
+    this.version = {
+      /**
+       * No description
+       *
+       * @tags miscellaneous
+       * @name GetVersion
+       * @summary Returns the version of the Gitea application
+       * @request GET:/version
+       * @secure
+       */
+      getVersion: (params = {}) => this.request(__spreadValues({
+        path: `/version`,
+        method: "GET",
+        secure: true
+      }, params))
+    };
+  }
+};
+
+// src/index.ts
+function giteaApi(baseUrl, options) {
+  return new Api(__spreadProps(__spreadValues({}, options), {
+    baseUrl: `${baseUrl}/api/v1`,
+    baseApiParams: {
+      format: "json"
+    },
+    securityWorker: (securityData) => {
+      if (!(options == null ? void 0 : options.token)) {
+        return;
+      }
+      return {
+        secure: true,
+        headers: {
+          Authorization: `Bearer ${options.token}`
+        }
+      };
+    }
+  }));
+}
+// Annotate the CommonJS export names for ESM import in node:
+0 && (0);
+/**
+ * @title Gitea API
+ * @version 1.23.1
+ * @license MIT (http://opensource.org/licenses/MIT)
+ * @baseUrl /api/v1
+ *
+ * This documentation describes the Gitea API.
+ */
+
+
+/***/ }),
+
 /***/ 845:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
@@ -6299,52 +11088,6 @@ module.exports = function (t) {
   }
   return r;
 };
-
-
-/***/ }),
-
-/***/ 3287:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-
-/*!
- * is-plain-object <https://github.com/jonschlinkert/is-plain-object>
- *
- * Copyright (c) 2014-2017, Jon Schlinkert.
- * Released under the MIT License.
- */
-
-function isObject(o) {
-  return Object.prototype.toString.call(o) === '[object Object]';
-}
-
-function isPlainObject(o) {
-  var ctor,prot;
-
-  if (isObject(o) === false) return false;
-
-  // If has modified constructor
-  ctor = o.constructor;
-  if (ctor === undefined) return true;
-
-  // If has modified prototype
-  prot = ctor.prototype;
-  if (isObject(prot) === false) return false;
-
-  // If constructor does not have an Object-specific method
-  if (prot.hasOwnProperty('isPrototypeOf') === false) {
-    return false;
-  }
-
-  // Most likely a plain Object
-  return true;
-}
-
-exports.isPlainObject = isPlainObject;
 
 
 /***/ }),
@@ -7912,10 +12655,6 @@ function getNodeRequestOptions(request) {
 		agent = agent(parsedURL);
 	}
 
-	if (!headers.has('Connection') && !agent) {
-		headers.set('Connection', 'close');
-	}
-
 	// HTTP-network fetch step 4.2
 	// chunked encoding is handled by Node.js
 
@@ -8289,8 +13028,11 @@ function fixResponseChunkedTransferBadEnding(request, errorCallback) {
 
 		if (headers['transfer-encoding'] === 'chunked' && !headers['content-length']) {
 			response.once('close', function (hadError) {
+				// tests for socket presence, as in some situations the
+				// the 'socket' event is not triggered for the request
+				// (happens in deno), avoids `TypeError`
 				// if a data listener is still present we didn't end cleanly
-				const hasDataListener = socket.listenerCount('data') > 0;
+				const hasDataListener = socket && socket.listenerCount('data') > 0;
 
 				if (hasDataListener && !hadError) {
 					const err = new Error('Premature close');
@@ -8332,55 +13074,7 @@ exports.Headers = Headers;
 exports.Request = Request;
 exports.Response = Response;
 exports.FetchError = FetchError;
-
-
-/***/ }),
-
-/***/ 1223:
-/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
-
-var wrappy = __nccwpck_require__(2940)
-module.exports = wrappy(once)
-module.exports.strict = wrappy(onceStrict)
-
-once.proto = once(function () {
-  Object.defineProperty(Function.prototype, 'once', {
-    value: function () {
-      return once(this)
-    },
-    configurable: true
-  })
-
-  Object.defineProperty(Function.prototype, 'onceStrict', {
-    value: function () {
-      return onceStrict(this)
-    },
-    configurable: true
-  })
-})
-
-function once (fn) {
-  var f = function () {
-    if (f.called) return f.value
-    f.called = true
-    return f.value = fn.apply(this, arguments)
-  }
-  f.called = false
-  return f
-}
-
-function onceStrict (fn) {
-  var f = function () {
-    if (f.called)
-      throw new Error(f.onceError)
-    f.called = true
-    return f.value = fn.apply(this, arguments)
-  }
-  var name = fn.name || 'Function wrapped with `once`'
-  f.onceError = name + " shouldn't be called more than once"
-  f.called = false
-  return f
-}
+exports.AbortError = AbortError;
 
 
 /***/ }),
@@ -8390,6 +13084,4971 @@ function onceStrict (fn) {
 
 "use strict";
 function _typeof(obj){"@babel/helpers - typeof";return _typeof="function"==typeof Symbol&&"symbol"==typeof Symbol.iterator?function(obj){return typeof obj}:function(obj){return obj&&"function"==typeof Symbol&&obj.constructor===Symbol&&obj!==Symbol.prototype?"symbol":typeof obj},_typeof(obj)}function _createForOfIteratorHelper(o,allowArrayLike){var it=typeof Symbol!=="undefined"&&o[Symbol.iterator]||o["@@iterator"];if(!it){if(Array.isArray(o)||(it=_unsupportedIterableToArray(o))||allowArrayLike&&o&&typeof o.length==="number"){if(it)o=it;var i=0;var F=function F(){};return{s:F,n:function n(){if(i>=o.length)return{done:true};return{done:false,value:o[i++]}},e:function e(_e2){throw _e2},f:F}}throw new TypeError("Invalid attempt to iterate non-iterable instance.\nIn order to be iterable, non-array objects must have a [Symbol.iterator]() method.")}var normalCompletion=true,didErr=false,err;return{s:function s(){it=it.call(o)},n:function n(){var step=it.next();normalCompletion=step.done;return step},e:function e(_e3){didErr=true;err=_e3},f:function f(){try{if(!normalCompletion&&it["return"]!=null)it["return"]()}finally{if(didErr)throw err}}}}function _defineProperty(obj,key,value){key=_toPropertyKey(key);if(key in obj){Object.defineProperty(obj,key,{value:value,enumerable:true,configurable:true,writable:true})}else{obj[key]=value}return obj}function _toPropertyKey(arg){var key=_toPrimitive(arg,"string");return _typeof(key)==="symbol"?key:String(key)}function _toPrimitive(input,hint){if(_typeof(input)!=="object"||input===null)return input;var prim=input[Symbol.toPrimitive];if(prim!==undefined){var res=prim.call(input,hint||"default");if(_typeof(res)!=="object")return res;throw new TypeError("@@toPrimitive must return a primitive value.")}return(hint==="string"?String:Number)(input)}function _slicedToArray(arr,i){return _arrayWithHoles(arr)||_iterableToArrayLimit(arr,i)||_unsupportedIterableToArray(arr,i)||_nonIterableRest()}function _nonIterableRest(){throw new TypeError("Invalid attempt to destructure non-iterable instance.\nIn order to be iterable, non-array objects must have a [Symbol.iterator]() method.")}function _unsupportedIterableToArray(o,minLen){if(!o)return;if(typeof o==="string")return _arrayLikeToArray(o,minLen);var n=Object.prototype.toString.call(o).slice(8,-1);if(n==="Object"&&o.constructor)n=o.constructor.name;if(n==="Map"||n==="Set")return Array.from(o);if(n==="Arguments"||/^(?:Ui|I)nt(?:8|16|32)(?:Clamped)?Array$/.test(n))return _arrayLikeToArray(o,minLen)}function _arrayLikeToArray(arr,len){if(len==null||len>arr.length)len=arr.length;for(var i=0,arr2=new Array(len);i<len;i++){arr2[i]=arr[i]}return arr2}function _iterableToArrayLimit(arr,i){var _i=null==arr?null:"undefined"!=typeof Symbol&&arr[Symbol.iterator]||arr["@@iterator"];if(null!=_i){var _s,_e,_x,_r,_arr=[],_n=!0,_d=!1;try{if(_x=(_i=_i.call(arr)).next,0===i){if(Object(_i)!==_i)return;_n=!1}else for(;!(_n=(_s=_x.call(_i)).done)&&(_arr.push(_s.value),_arr.length!==i);_n=!0){;}}catch(err){_d=!0,_e=err}finally{try{if(!_n&&null!=_i["return"]&&(_r=_i["return"](),Object(_r)!==_r))return}finally{if(_d)throw _e}}return _arr}}function _arrayWithHoles(arr){if(Array.isArray(arr))return arr}module.exports=function(input){if(!input)return[];if(typeof input!=="string"||input.match(/^\s+$/))return[];var lines=input.split("\n");if(lines.length===0)return[];var files=[];var currentFile=null;var currentChunk=null;var deletedLineCounter=0;var addedLineCounter=0;var currentFileChanges=null;var normal=function normal(line){var _currentChunk;(_currentChunk=currentChunk)===null||_currentChunk===void 0?void 0:_currentChunk.changes.push({type:"normal",normal:true,ln1:deletedLineCounter++,ln2:addedLineCounter++,content:line});currentFileChanges.oldLines--;currentFileChanges.newLines--};var start=function start(line){var _parseFiles;var _ref=(_parseFiles=parseFiles(line))!==null&&_parseFiles!==void 0?_parseFiles:[],_ref2=_slicedToArray(_ref,2),fromFileName=_ref2[0],toFileName=_ref2[1];currentFile={chunks:[],deletions:0,additions:0,from:fromFileName,to:toFileName};files.push(currentFile)};var restart=function restart(){if(!currentFile||currentFile.chunks.length)start()};var newFile=function newFile(_,match){restart();currentFile["new"]=true;currentFile.newMode=match[1];currentFile.from="/dev/null"};var deletedFile=function deletedFile(_,match){restart();currentFile.deleted=true;currentFile.oldMode=match[1];currentFile.to="/dev/null"};var oldMode=function oldMode(_,match){restart();currentFile.oldMode=match[1]};var newMode=function newMode(_,match){restart();currentFile.newMode=match[1]};var index=function index(line,match){restart();currentFile.index=line.split(" ").slice(1);if(match[1]){currentFile.oldMode=currentFile.newMode=match[1].trim()}};var fromFile=function fromFile(line){restart();currentFile.from=parseOldOrNewFile(line)};var toFile=function toFile(line){restart();currentFile.to=parseOldOrNewFile(line)};var toNumOfLines=function toNumOfLines(number){return+(number||1)};var chunk=function chunk(line,match){if(!currentFile){start(line)}var _match$slice=match.slice(1),_match$slice2=_slicedToArray(_match$slice,4),oldStart=_match$slice2[0],oldNumLines=_match$slice2[1],newStart=_match$slice2[2],newNumLines=_match$slice2[3];deletedLineCounter=+oldStart;addedLineCounter=+newStart;currentChunk={content:line,changes:[],oldStart:+oldStart,oldLines:toNumOfLines(oldNumLines),newStart:+newStart,newLines:toNumOfLines(newNumLines)};currentFileChanges={oldLines:toNumOfLines(oldNumLines),newLines:toNumOfLines(newNumLines)};currentFile.chunks.push(currentChunk)};var del=function del(line){if(!currentChunk)return;currentChunk.changes.push({type:"del",del:true,ln:deletedLineCounter++,content:line});currentFile.deletions++;currentFileChanges.oldLines--};var add=function add(line){if(!currentChunk)return;currentChunk.changes.push({type:"add",add:true,ln:addedLineCounter++,content:line});currentFile.additions++;currentFileChanges.newLines--};var eof=function eof(line){var _currentChunk$changes3;if(!currentChunk)return;var _currentChunk$changes=currentChunk.changes.slice(-1),_currentChunk$changes2=_slicedToArray(_currentChunk$changes,1),mostRecentChange=_currentChunk$changes2[0];currentChunk.changes.push((_currentChunk$changes3={type:mostRecentChange.type},_defineProperty(_currentChunk$changes3,mostRecentChange.type,true),_defineProperty(_currentChunk$changes3,"ln1",mostRecentChange.ln1),_defineProperty(_currentChunk$changes3,"ln2",mostRecentChange.ln2),_defineProperty(_currentChunk$changes3,"ln",mostRecentChange.ln),_defineProperty(_currentChunk$changes3,"content",line),_currentChunk$changes3))};var schemaHeaders=[[/^diff\s/,start],[/^new file mode (\d+)$/,newFile],[/^deleted file mode (\d+)$/,deletedFile],[/^old mode (\d+)$/,oldMode],[/^new mode (\d+)$/,newMode],[/^index\s[\da-zA-Z]+\.\.[\da-zA-Z]+(\s(\d+))?$/,index],[/^---\s/,fromFile],[/^\+\+\+\s/,toFile],[/^@@\s+-(\d+),?(\d+)?\s+\+(\d+),?(\d+)?\s@@/,chunk],[/^\\ No newline at end of file$/,eof]];var schemaContent=[[/^\\ No newline at end of file$/,eof],[/^-/,del],[/^\+/,add],[/^\s+/,normal]];var parseContentLine=function parseContentLine(line){for(var _i2=0,_schemaContent=schemaContent;_i2<_schemaContent.length;_i2++){var _schemaContent$_i=_slicedToArray(_schemaContent[_i2],2),pattern=_schemaContent$_i[0],handler=_schemaContent$_i[1];var match=line.match(pattern);if(match){handler(line,match);break}}if(currentFileChanges.oldLines===0&&currentFileChanges.newLines===0){currentFileChanges=null}};var parseHeaderLine=function parseHeaderLine(line){for(var _i3=0,_schemaHeaders=schemaHeaders;_i3<_schemaHeaders.length;_i3++){var _schemaHeaders$_i=_slicedToArray(_schemaHeaders[_i3],2),pattern=_schemaHeaders$_i[0],handler=_schemaHeaders$_i[1];var match=line.match(pattern);if(match){handler(line,match);break}}};var parseLine=function parseLine(line){if(currentFileChanges){parseContentLine(line)}else{parseHeaderLine(line)}return};var _iterator=_createForOfIteratorHelper(lines),_step;try{for(_iterator.s();!(_step=_iterator.n()).done;){var line=_step.value;parseLine(line)}}catch(err){_iterator.e(err)}finally{_iterator.f()}return files};var fileNameDiffRegex=/(a|i|w|c|o|1|2)\/.*(?=["']? ["']?(b|i|w|c|o|1|2)\/)|(b|i|w|c|o|1|2)\/.*$/g;var gitFileHeaderRegex=/^(a|b|i|w|c|o|1|2)\//;var parseFiles=function parseFiles(line){var fileNames=line===null||line===void 0?void 0:line.match(fileNameDiffRegex);return fileNames===null||fileNames===void 0?void 0:fileNames.map(function(fileName){return fileName.replace(gitFileHeaderRegex,"").replace(/("|')$/,"")})};var qoutedFileNameRegex=/^\\?['"]|\\?['"]$/g;var parseOldOrNewFile=function parseOldOrNewFile(line){var fileName=leftTrimChars(line,"-+").trim();fileName=removeTimeStamp(fileName);return fileName.replace(qoutedFileNameRegex,"").replace(gitFileHeaderRegex,"")};var leftTrimChars=function leftTrimChars(string,trimmingChars){string=makeString(string);if(!trimmingChars&&String.prototype.trimLeft)return string.trimLeft();var trimmingString=formTrimmingString(trimmingChars);return string.replace(new RegExp("^".concat(trimmingString,"+")),"")};var timeStampRegex=/\t.*|\d{4}-\d\d-\d\d\s\d\d:\d\d:\d\d(.\d+)?\s(\+|-)\d\d\d\d/;var removeTimeStamp=function removeTimeStamp(string){var timeStamp=timeStampRegex.exec(string);if(timeStamp){string=string.substring(0,timeStamp.index).trim()}return string};var formTrimmingString=function formTrimmingString(trimmingChars){if(trimmingChars===null||trimmingChars===undefined)return"\\s";else if(trimmingChars instanceof RegExp)return trimmingChars.source;return"[".concat(makeString(trimmingChars).replace(/([.*+?^=!:${}()|[\]/\\])/g,"\\$1"),"]")};var makeString=function makeString(itemToConvert){return(itemToConvert!==null&&itemToConvert!==void 0?itemToConvert:"")+""};
+
+
+/***/ }),
+
+/***/ 9103:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+var __create = Object.create;
+var __defProp = Object.defineProperty;
+var __defProps = Object.defineProperties;
+var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
+var __getOwnPropDescs = Object.getOwnPropertyDescriptors;
+var __getOwnPropNames = Object.getOwnPropertyNames;
+var __getOwnPropSymbols = Object.getOwnPropertySymbols;
+var __getProtoOf = Object.getPrototypeOf;
+var __hasOwnProp = Object.prototype.hasOwnProperty;
+var __propIsEnum = Object.prototype.propertyIsEnumerable;
+var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
+var __spreadValues = (a, b) => {
+  for (var prop in b || (b = {}))
+    if (__hasOwnProp.call(b, prop))
+      __defNormalProp(a, prop, b[prop]);
+  if (__getOwnPropSymbols)
+    for (var prop of __getOwnPropSymbols(b)) {
+      if (__propIsEnum.call(b, prop))
+        __defNormalProp(a, prop, b[prop]);
+    }
+  return a;
+};
+var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
+var __esm = (fn, res) => function __init() {
+  return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
+};
+var __commonJS = (cb, mod) => function __require() {
+  return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
+};
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
+};
+var __copyProps = (to, from, except, desc) => {
+  if (from && typeof from === "object" || typeof from === "function") {
+    for (let key of __getOwnPropNames(from))
+      if (!__hasOwnProp.call(to, key) && key !== except)
+        __defProp(to, key, { get: () => from[key], enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable });
+  }
+  return to;
+};
+var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__getProtoOf(mod)) : {}, __copyProps(
+  isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target,
+  mod
+));
+var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
+var __async = (__this, __arguments, generator) => {
+  return new Promise((resolve, reject) => {
+    var fulfilled = (value) => {
+      try {
+        step(generator.next(value));
+      } catch (e) {
+        reject(e);
+      }
+    };
+    var rejected = (value) => {
+      try {
+        step(generator.throw(value));
+      } catch (e) {
+        reject(e);
+      }
+    };
+    var step = (x) => x.done ? resolve(x.value) : Promise.resolve(x.value).then(fulfilled, rejected);
+    step((generator = generator.apply(__this, __arguments)).next());
+  });
+};
+
+// src/lib/errors/git-error.ts
+var GitError;
+var init_git_error = __esm({
+  "src/lib/errors/git-error.ts"() {
+    "use strict";
+    GitError = class extends Error {
+      constructor(task, message) {
+        super(message);
+        this.task = task;
+        Object.setPrototypeOf(this, new.target.prototype);
+      }
+    };
+  }
+});
+
+// src/lib/errors/git-response-error.ts
+var GitResponseError;
+var init_git_response_error = __esm({
+  "src/lib/errors/git-response-error.ts"() {
+    "use strict";
+    init_git_error();
+    GitResponseError = class extends GitError {
+      constructor(git, message) {
+        super(void 0, message || String(git));
+        this.git = git;
+      }
+    };
+  }
+});
+
+// src/lib/args/pathspec.ts
+function pathspec(...paths) {
+  const key = new String(paths);
+  cache.set(key, paths);
+  return key;
+}
+function isPathSpec(path) {
+  return path instanceof String && cache.has(path);
+}
+function toPaths(pathSpec) {
+  return cache.get(pathSpec) || [];
+}
+var cache;
+var init_pathspec = __esm({
+  "src/lib/args/pathspec.ts"() {
+    "use strict";
+    cache = /* @__PURE__ */ new WeakMap();
+  }
+});
+
+// src/lib/errors/git-construct-error.ts
+var GitConstructError;
+var init_git_construct_error = __esm({
+  "src/lib/errors/git-construct-error.ts"() {
+    "use strict";
+    init_git_error();
+    GitConstructError = class extends GitError {
+      constructor(config, message) {
+        super(void 0, message);
+        this.config = config;
+      }
+    };
+  }
+});
+
+// src/lib/errors/git-plugin-error.ts
+var GitPluginError;
+var init_git_plugin_error = __esm({
+  "src/lib/errors/git-plugin-error.ts"() {
+    "use strict";
+    init_git_error();
+    GitPluginError = class extends GitError {
+      constructor(task, plugin, message) {
+        super(task, message);
+        this.task = task;
+        this.plugin = plugin;
+        Object.setPrototypeOf(this, new.target.prototype);
+      }
+    };
+  }
+});
+
+// src/lib/errors/task-configuration-error.ts
+var TaskConfigurationError;
+var init_task_configuration_error = __esm({
+  "src/lib/errors/task-configuration-error.ts"() {
+    "use strict";
+    init_git_error();
+    TaskConfigurationError = class extends GitError {
+      constructor(message) {
+        super(void 0, message);
+      }
+    };
+  }
+});
+
+// src/lib/utils/util.ts
+function asFunction(source) {
+  return typeof source === "function" ? source : NOOP;
+}
+function isUserFunction(source) {
+  return typeof source === "function" && source !== NOOP;
+}
+function splitOn(input, char) {
+  const index = input.indexOf(char);
+  if (index <= 0) {
+    return [input, ""];
+  }
+  return [input.substr(0, index), input.substr(index + 1)];
+}
+function first(input, offset = 0) {
+  return isArrayLike(input) && input.length > offset ? input[offset] : void 0;
+}
+function last(input, offset = 0) {
+  if (isArrayLike(input) && input.length > offset) {
+    return input[input.length - 1 - offset];
+  }
+}
+function isArrayLike(input) {
+  return !!(input && typeof input.length === "number");
+}
+function toLinesWithContent(input = "", trimmed2 = true, separator = "\n") {
+  return input.split(separator).reduce((output, line) => {
+    const lineContent = trimmed2 ? line.trim() : line;
+    if (lineContent) {
+      output.push(lineContent);
+    }
+    return output;
+  }, []);
+}
+function forEachLineWithContent(input, callback) {
+  return toLinesWithContent(input, true).map((line) => callback(line));
+}
+function folderExists(path) {
+  return (0, import_file_exists.exists)(path, import_file_exists.FOLDER);
+}
+function append(target, item) {
+  if (Array.isArray(target)) {
+    if (!target.includes(item)) {
+      target.push(item);
+    }
+  } else {
+    target.add(item);
+  }
+  return item;
+}
+function including(target, item) {
+  if (Array.isArray(target) && !target.includes(item)) {
+    target.push(item);
+  }
+  return target;
+}
+function remove(target, item) {
+  if (Array.isArray(target)) {
+    const index = target.indexOf(item);
+    if (index >= 0) {
+      target.splice(index, 1);
+    }
+  } else {
+    target.delete(item);
+  }
+  return item;
+}
+function asArray(source) {
+  return Array.isArray(source) ? source : [source];
+}
+function asCamelCase(str) {
+  return str.replace(/[\s-]+(.)/g, (_all, chr) => {
+    return chr.toUpperCase();
+  });
+}
+function asStringArray(source) {
+  return asArray(source).map(String);
+}
+function asNumber(source, onNaN = 0) {
+  if (source == null) {
+    return onNaN;
+  }
+  const num = parseInt(source, 10);
+  return isNaN(num) ? onNaN : num;
+}
+function prefixedArray(input, prefix) {
+  const output = [];
+  for (let i = 0, max = input.length; i < max; i++) {
+    output.push(prefix, input[i]);
+  }
+  return output;
+}
+function bufferToString(input) {
+  return (Array.isArray(input) ? Buffer.concat(input) : input).toString("utf-8");
+}
+function pick(source, properties) {
+  return Object.assign(
+    {},
+    ...properties.map((property) => property in source ? { [property]: source[property] } : {})
+  );
+}
+function delay(duration = 0) {
+  return new Promise((done) => setTimeout(done, duration));
+}
+function orVoid(input) {
+  if (input === false) {
+    return void 0;
+  }
+  return input;
+}
+var import_file_exists, NULL, NOOP, objectToString;
+var init_util = __esm({
+  "src/lib/utils/util.ts"() {
+    "use strict";
+    import_file_exists = __nccwpck_require__(4751);
+    NULL = "\0";
+    NOOP = () => {
+    };
+    objectToString = Object.prototype.toString.call.bind(Object.prototype.toString);
+  }
+});
+
+// src/lib/utils/argument-filters.ts
+function filterType(input, filter, def) {
+  if (filter(input)) {
+    return input;
+  }
+  return arguments.length > 2 ? def : void 0;
+}
+function filterPrimitives(input, omit) {
+  const type = isPathSpec(input) ? "string" : typeof input;
+  return /number|string|boolean/.test(type) && (!omit || !omit.includes(type));
+}
+function filterPlainObject(input) {
+  return !!input && objectToString(input) === "[object Object]";
+}
+function filterFunction(input) {
+  return typeof input === "function";
+}
+var filterArray, filterString, filterStringArray, filterStringOrStringArray, filterHasLength;
+var init_argument_filters = __esm({
+  "src/lib/utils/argument-filters.ts"() {
+    "use strict";
+    init_util();
+    init_pathspec();
+    filterArray = (input) => {
+      return Array.isArray(input);
+    };
+    filterString = (input) => {
+      return typeof input === "string";
+    };
+    filterStringArray = (input) => {
+      return Array.isArray(input) && input.every(filterString);
+    };
+    filterStringOrStringArray = (input) => {
+      return filterString(input) || Array.isArray(input) && input.every(filterString);
+    };
+    filterHasLength = (input) => {
+      if (input == null || "number|boolean|function".includes(typeof input)) {
+        return false;
+      }
+      return Array.isArray(input) || typeof input === "string" || typeof input.length === "number";
+    };
+  }
+});
+
+// src/lib/utils/exit-codes.ts
+var ExitCodes;
+var init_exit_codes = __esm({
+  "src/lib/utils/exit-codes.ts"() {
+    "use strict";
+    ExitCodes = /* @__PURE__ */ ((ExitCodes2) => {
+      ExitCodes2[ExitCodes2["SUCCESS"] = 0] = "SUCCESS";
+      ExitCodes2[ExitCodes2["ERROR"] = 1] = "ERROR";
+      ExitCodes2[ExitCodes2["NOT_FOUND"] = -2] = "NOT_FOUND";
+      ExitCodes2[ExitCodes2["UNCLEAN"] = 128] = "UNCLEAN";
+      return ExitCodes2;
+    })(ExitCodes || {});
+  }
+});
+
+// src/lib/utils/git-output-streams.ts
+var GitOutputStreams;
+var init_git_output_streams = __esm({
+  "src/lib/utils/git-output-streams.ts"() {
+    "use strict";
+    GitOutputStreams = class {
+      constructor(stdOut, stdErr) {
+        this.stdOut = stdOut;
+        this.stdErr = stdErr;
+      }
+      asStrings() {
+        return new GitOutputStreams(this.stdOut.toString("utf8"), this.stdErr.toString("utf8"));
+      }
+    };
+  }
+});
+
+// src/lib/utils/line-parser.ts
+var LineParser, RemoteLineParser;
+var init_line_parser = __esm({
+  "src/lib/utils/line-parser.ts"() {
+    "use strict";
+    LineParser = class {
+      constructor(regExp, useMatches) {
+        this.matches = [];
+        this.parse = (line, target) => {
+          this.resetMatches();
+          if (!this._regExp.every((reg, index) => this.addMatch(reg, index, line(index)))) {
+            return false;
+          }
+          return this.useMatches(target, this.prepareMatches()) !== false;
+        };
+        this._regExp = Array.isArray(regExp) ? regExp : [regExp];
+        if (useMatches) {
+          this.useMatches = useMatches;
+        }
+      }
+      useMatches(target, match) {
+        throw new Error(`LineParser:useMatches not implemented`);
+      }
+      resetMatches() {
+        this.matches.length = 0;
+      }
+      prepareMatches() {
+        return this.matches;
+      }
+      addMatch(reg, index, line) {
+        const matched = line && reg.exec(line);
+        if (matched) {
+          this.pushMatch(index, matched);
+        }
+        return !!matched;
+      }
+      pushMatch(_index, matched) {
+        this.matches.push(...matched.slice(1));
+      }
+    };
+    RemoteLineParser = class extends LineParser {
+      addMatch(reg, index, line) {
+        return /^remote:\s/.test(String(line)) && super.addMatch(reg, index, line);
+      }
+      pushMatch(index, matched) {
+        if (index > 0 || matched.length > 1) {
+          super.pushMatch(index, matched);
+        }
+      }
+    };
+  }
+});
+
+// src/lib/utils/simple-git-options.ts
+function createInstanceConfig(...options) {
+  const baseDir = process.cwd();
+  const config = Object.assign(
+    __spreadValues({ baseDir }, defaultOptions),
+    ...options.filter((o) => typeof o === "object" && o)
+  );
+  config.baseDir = config.baseDir || baseDir;
+  config.trimmed = config.trimmed === true;
+  return config;
+}
+var defaultOptions;
+var init_simple_git_options = __esm({
+  "src/lib/utils/simple-git-options.ts"() {
+    "use strict";
+    defaultOptions = {
+      binary: "git",
+      maxConcurrentProcesses: 5,
+      config: [],
+      trimmed: false
+    };
+  }
+});
+
+// src/lib/utils/task-options.ts
+function appendTaskOptions(options, commands = []) {
+  if (!filterPlainObject(options)) {
+    return commands;
+  }
+  return Object.keys(options).reduce((commands2, key) => {
+    const value = options[key];
+    if (isPathSpec(value)) {
+      commands2.push(value);
+    } else if (filterPrimitives(value, ["boolean"])) {
+      commands2.push(key + "=" + value);
+    } else {
+      commands2.push(key);
+    }
+    return commands2;
+  }, commands);
+}
+function getTrailingOptions(args, initialPrimitive = 0, objectOnly = false) {
+  const command = [];
+  for (let i = 0, max = initialPrimitive < 0 ? args.length : initialPrimitive; i < max; i++) {
+    if ("string|number".includes(typeof args[i])) {
+      command.push(String(args[i]));
+    }
+  }
+  appendTaskOptions(trailingOptionsArgument(args), command);
+  if (!objectOnly) {
+    command.push(...trailingArrayArgument(args));
+  }
+  return command;
+}
+function trailingArrayArgument(args) {
+  const hasTrailingCallback = typeof last(args) === "function";
+  return filterType(last(args, hasTrailingCallback ? 1 : 0), filterArray, []);
+}
+function trailingOptionsArgument(args) {
+  const hasTrailingCallback = filterFunction(last(args));
+  return filterType(last(args, hasTrailingCallback ? 1 : 0), filterPlainObject);
+}
+function trailingFunctionArgument(args, includeNoop = true) {
+  const callback = asFunction(last(args));
+  return includeNoop || isUserFunction(callback) ? callback : void 0;
+}
+var init_task_options = __esm({
+  "src/lib/utils/task-options.ts"() {
+    "use strict";
+    init_argument_filters();
+    init_util();
+    init_pathspec();
+  }
+});
+
+// src/lib/utils/task-parser.ts
+function callTaskParser(parser4, streams) {
+  return parser4(streams.stdOut, streams.stdErr);
+}
+function parseStringResponse(result, parsers12, texts, trim = true) {
+  asArray(texts).forEach((text) => {
+    for (let lines = toLinesWithContent(text, trim), i = 0, max = lines.length; i < max; i++) {
+      const line = (offset = 0) => {
+        if (i + offset >= max) {
+          return;
+        }
+        return lines[i + offset];
+      };
+      parsers12.some(({ parse }) => parse(line, result));
+    }
+  });
+  return result;
+}
+var init_task_parser = __esm({
+  "src/lib/utils/task-parser.ts"() {
+    "use strict";
+    init_util();
+  }
+});
+
+// src/lib/utils/index.ts
+var utils_exports = {};
+__export(utils_exports, {
+  ExitCodes: () => ExitCodes,
+  GitOutputStreams: () => GitOutputStreams,
+  LineParser: () => LineParser,
+  NOOP: () => NOOP,
+  NULL: () => NULL,
+  RemoteLineParser: () => RemoteLineParser,
+  append: () => append,
+  appendTaskOptions: () => appendTaskOptions,
+  asArray: () => asArray,
+  asCamelCase: () => asCamelCase,
+  asFunction: () => asFunction,
+  asNumber: () => asNumber,
+  asStringArray: () => asStringArray,
+  bufferToString: () => bufferToString,
+  callTaskParser: () => callTaskParser,
+  createInstanceConfig: () => createInstanceConfig,
+  delay: () => delay,
+  filterArray: () => filterArray,
+  filterFunction: () => filterFunction,
+  filterHasLength: () => filterHasLength,
+  filterPlainObject: () => filterPlainObject,
+  filterPrimitives: () => filterPrimitives,
+  filterString: () => filterString,
+  filterStringArray: () => filterStringArray,
+  filterStringOrStringArray: () => filterStringOrStringArray,
+  filterType: () => filterType,
+  first: () => first,
+  folderExists: () => folderExists,
+  forEachLineWithContent: () => forEachLineWithContent,
+  getTrailingOptions: () => getTrailingOptions,
+  including: () => including,
+  isUserFunction: () => isUserFunction,
+  last: () => last,
+  objectToString: () => objectToString,
+  orVoid: () => orVoid,
+  parseStringResponse: () => parseStringResponse,
+  pick: () => pick,
+  prefixedArray: () => prefixedArray,
+  remove: () => remove,
+  splitOn: () => splitOn,
+  toLinesWithContent: () => toLinesWithContent,
+  trailingFunctionArgument: () => trailingFunctionArgument,
+  trailingOptionsArgument: () => trailingOptionsArgument
+});
+var init_utils = __esm({
+  "src/lib/utils/index.ts"() {
+    "use strict";
+    init_argument_filters();
+    init_exit_codes();
+    init_git_output_streams();
+    init_line_parser();
+    init_simple_git_options();
+    init_task_options();
+    init_task_parser();
+    init_util();
+  }
+});
+
+// src/lib/tasks/check-is-repo.ts
+var check_is_repo_exports = {};
+__export(check_is_repo_exports, {
+  CheckRepoActions: () => CheckRepoActions,
+  checkIsBareRepoTask: () => checkIsBareRepoTask,
+  checkIsRepoRootTask: () => checkIsRepoRootTask,
+  checkIsRepoTask: () => checkIsRepoTask
+});
+function checkIsRepoTask(action) {
+  switch (action) {
+    case "bare" /* BARE */:
+      return checkIsBareRepoTask();
+    case "root" /* IS_REPO_ROOT */:
+      return checkIsRepoRootTask();
+  }
+  const commands = ["rev-parse", "--is-inside-work-tree"];
+  return {
+    commands,
+    format: "utf-8",
+    onError,
+    parser
+  };
+}
+function checkIsRepoRootTask() {
+  const commands = ["rev-parse", "--git-dir"];
+  return {
+    commands,
+    format: "utf-8",
+    onError,
+    parser(path) {
+      return /^\.(git)?$/.test(path.trim());
+    }
+  };
+}
+function checkIsBareRepoTask() {
+  const commands = ["rev-parse", "--is-bare-repository"];
+  return {
+    commands,
+    format: "utf-8",
+    onError,
+    parser
+  };
+}
+function isNotRepoMessage(error) {
+  return /(Not a git repository|Kein Git-Repository)/i.test(String(error));
+}
+var CheckRepoActions, onError, parser;
+var init_check_is_repo = __esm({
+  "src/lib/tasks/check-is-repo.ts"() {
+    "use strict";
+    init_utils();
+    CheckRepoActions = /* @__PURE__ */ ((CheckRepoActions2) => {
+      CheckRepoActions2["BARE"] = "bare";
+      CheckRepoActions2["IN_TREE"] = "tree";
+      CheckRepoActions2["IS_REPO_ROOT"] = "root";
+      return CheckRepoActions2;
+    })(CheckRepoActions || {});
+    onError = ({ exitCode }, error, done, fail) => {
+      if (exitCode === 128 /* UNCLEAN */ && isNotRepoMessage(error)) {
+        return done(Buffer.from("false"));
+      }
+      fail(error);
+    };
+    parser = (text) => {
+      return text.trim() === "true";
+    };
+  }
+});
+
+// src/lib/responses/CleanSummary.ts
+function cleanSummaryParser(dryRun, text) {
+  const summary = new CleanResponse(dryRun);
+  const regexp = dryRun ? dryRunRemovalRegexp : removalRegexp;
+  toLinesWithContent(text).forEach((line) => {
+    const removed = line.replace(regexp, "");
+    summary.paths.push(removed);
+    (isFolderRegexp.test(removed) ? summary.folders : summary.files).push(removed);
+  });
+  return summary;
+}
+var CleanResponse, removalRegexp, dryRunRemovalRegexp, isFolderRegexp;
+var init_CleanSummary = __esm({
+  "src/lib/responses/CleanSummary.ts"() {
+    "use strict";
+    init_utils();
+    CleanResponse = class {
+      constructor(dryRun) {
+        this.dryRun = dryRun;
+        this.paths = [];
+        this.files = [];
+        this.folders = [];
+      }
+    };
+    removalRegexp = /^[a-z]+\s*/i;
+    dryRunRemovalRegexp = /^[a-z]+\s+[a-z]+\s*/i;
+    isFolderRegexp = /\/$/;
+  }
+});
+
+// src/lib/tasks/task.ts
+var task_exports = {};
+__export(task_exports, {
+  EMPTY_COMMANDS: () => EMPTY_COMMANDS,
+  adhocExecTask: () => adhocExecTask,
+  configurationErrorTask: () => configurationErrorTask,
+  isBufferTask: () => isBufferTask,
+  isEmptyTask: () => isEmptyTask,
+  straightThroughBufferTask: () => straightThroughBufferTask,
+  straightThroughStringTask: () => straightThroughStringTask
+});
+function adhocExecTask(parser4) {
+  return {
+    commands: EMPTY_COMMANDS,
+    format: "empty",
+    parser: parser4
+  };
+}
+function configurationErrorTask(error) {
+  return {
+    commands: EMPTY_COMMANDS,
+    format: "empty",
+    parser() {
+      throw typeof error === "string" ? new TaskConfigurationError(error) : error;
+    }
+  };
+}
+function straightThroughStringTask(commands, trimmed2 = false) {
+  return {
+    commands,
+    format: "utf-8",
+    parser(text) {
+      return trimmed2 ? String(text).trim() : text;
+    }
+  };
+}
+function straightThroughBufferTask(commands) {
+  return {
+    commands,
+    format: "buffer",
+    parser(buffer) {
+      return buffer;
+    }
+  };
+}
+function isBufferTask(task) {
+  return task.format === "buffer";
+}
+function isEmptyTask(task) {
+  return task.format === "empty" || !task.commands.length;
+}
+var EMPTY_COMMANDS;
+var init_task = __esm({
+  "src/lib/tasks/task.ts"() {
+    "use strict";
+    init_task_configuration_error();
+    EMPTY_COMMANDS = [];
+  }
+});
+
+// src/lib/tasks/clean.ts
+var clean_exports = {};
+__export(clean_exports, {
+  CONFIG_ERROR_INTERACTIVE_MODE: () => CONFIG_ERROR_INTERACTIVE_MODE,
+  CONFIG_ERROR_MODE_REQUIRED: () => CONFIG_ERROR_MODE_REQUIRED,
+  CONFIG_ERROR_UNKNOWN_OPTION: () => CONFIG_ERROR_UNKNOWN_OPTION,
+  CleanOptions: () => CleanOptions,
+  cleanTask: () => cleanTask,
+  cleanWithOptionsTask: () => cleanWithOptionsTask,
+  isCleanOptionsArray: () => isCleanOptionsArray
+});
+function cleanWithOptionsTask(mode, customArgs) {
+  const { cleanMode, options, valid } = getCleanOptions(mode);
+  if (!cleanMode) {
+    return configurationErrorTask(CONFIG_ERROR_MODE_REQUIRED);
+  }
+  if (!valid.options) {
+    return configurationErrorTask(CONFIG_ERROR_UNKNOWN_OPTION + JSON.stringify(mode));
+  }
+  options.push(...customArgs);
+  if (options.some(isInteractiveMode)) {
+    return configurationErrorTask(CONFIG_ERROR_INTERACTIVE_MODE);
+  }
+  return cleanTask(cleanMode, options);
+}
+function cleanTask(mode, customArgs) {
+  const commands = ["clean", `-${mode}`, ...customArgs];
+  return {
+    commands,
+    format: "utf-8",
+    parser(text) {
+      return cleanSummaryParser(mode === "n" /* DRY_RUN */, text);
+    }
+  };
+}
+function isCleanOptionsArray(input) {
+  return Array.isArray(input) && input.every((test) => CleanOptionValues.has(test));
+}
+function getCleanOptions(input) {
+  let cleanMode;
+  let options = [];
+  let valid = { cleanMode: false, options: true };
+  input.replace(/[^a-z]i/g, "").split("").forEach((char) => {
+    if (isCleanMode(char)) {
+      cleanMode = char;
+      valid.cleanMode = true;
+    } else {
+      valid.options = valid.options && isKnownOption(options[options.length] = `-${char}`);
+    }
+  });
+  return {
+    cleanMode,
+    options,
+    valid
+  };
+}
+function isCleanMode(cleanMode) {
+  return cleanMode === "f" /* FORCE */ || cleanMode === "n" /* DRY_RUN */;
+}
+function isKnownOption(option) {
+  return /^-[a-z]$/i.test(option) && CleanOptionValues.has(option.charAt(1));
+}
+function isInteractiveMode(option) {
+  if (/^-[^\-]/.test(option)) {
+    return option.indexOf("i") > 0;
+  }
+  return option === "--interactive";
+}
+var CONFIG_ERROR_INTERACTIVE_MODE, CONFIG_ERROR_MODE_REQUIRED, CONFIG_ERROR_UNKNOWN_OPTION, CleanOptions, CleanOptionValues;
+var init_clean = __esm({
+  "src/lib/tasks/clean.ts"() {
+    "use strict";
+    init_CleanSummary();
+    init_utils();
+    init_task();
+    CONFIG_ERROR_INTERACTIVE_MODE = "Git clean interactive mode is not supported";
+    CONFIG_ERROR_MODE_REQUIRED = 'Git clean mode parameter ("n" or "f") is required';
+    CONFIG_ERROR_UNKNOWN_OPTION = "Git clean unknown option found in: ";
+    CleanOptions = /* @__PURE__ */ ((CleanOptions2) => {
+      CleanOptions2["DRY_RUN"] = "n";
+      CleanOptions2["FORCE"] = "f";
+      CleanOptions2["IGNORED_INCLUDED"] = "x";
+      CleanOptions2["IGNORED_ONLY"] = "X";
+      CleanOptions2["EXCLUDING"] = "e";
+      CleanOptions2["QUIET"] = "q";
+      CleanOptions2["RECURSIVE"] = "d";
+      return CleanOptions2;
+    })(CleanOptions || {});
+    CleanOptionValues = /* @__PURE__ */ new Set([
+      "i",
+      ...asStringArray(Object.values(CleanOptions))
+    ]);
+  }
+});
+
+// src/lib/responses/ConfigList.ts
+function configListParser(text) {
+  const config = new ConfigList();
+  for (const item of configParser(text)) {
+    config.addValue(item.file, String(item.key), item.value);
+  }
+  return config;
+}
+function configGetParser(text, key) {
+  let value = null;
+  const values = [];
+  const scopes = /* @__PURE__ */ new Map();
+  for (const item of configParser(text, key)) {
+    if (item.key !== key) {
+      continue;
+    }
+    values.push(value = item.value);
+    if (!scopes.has(item.file)) {
+      scopes.set(item.file, []);
+    }
+    scopes.get(item.file).push(value);
+  }
+  return {
+    key,
+    paths: Array.from(scopes.keys()),
+    scopes,
+    value,
+    values
+  };
+}
+function configFilePath(filePath) {
+  return filePath.replace(/^(file):/, "");
+}
+function* configParser(text, requestedKey = null) {
+  const lines = text.split("\0");
+  for (let i = 0, max = lines.length - 1; i < max; ) {
+    const file = configFilePath(lines[i++]);
+    let value = lines[i++];
+    let key = requestedKey;
+    if (value.includes("\n")) {
+      const line = splitOn(value, "\n");
+      key = line[0];
+      value = line[1];
+    }
+    yield { file, key, value };
+  }
+}
+var ConfigList;
+var init_ConfigList = __esm({
+  "src/lib/responses/ConfigList.ts"() {
+    "use strict";
+    init_utils();
+    ConfigList = class {
+      constructor() {
+        this.files = [];
+        this.values = /* @__PURE__ */ Object.create(null);
+      }
+      get all() {
+        if (!this._all) {
+          this._all = this.files.reduce((all, file) => {
+            return Object.assign(all, this.values[file]);
+          }, {});
+        }
+        return this._all;
+      }
+      addFile(file) {
+        if (!(file in this.values)) {
+          const latest = last(this.files);
+          this.values[file] = latest ? Object.create(this.values[latest]) : {};
+          this.files.push(file);
+        }
+        return this.values[file];
+      }
+      addValue(file, key, value) {
+        const values = this.addFile(file);
+        if (!values.hasOwnProperty(key)) {
+          values[key] = value;
+        } else if (Array.isArray(values[key])) {
+          values[key].push(value);
+        } else {
+          values[key] = [values[key], value];
+        }
+        this._all = void 0;
+      }
+    };
+  }
+});
+
+// src/lib/tasks/config.ts
+function asConfigScope(scope, fallback) {
+  if (typeof scope === "string" && GitConfigScope.hasOwnProperty(scope)) {
+    return scope;
+  }
+  return fallback;
+}
+function addConfigTask(key, value, append2, scope) {
+  const commands = ["config", `--${scope}`];
+  if (append2) {
+    commands.push("--add");
+  }
+  commands.push(key, value);
+  return {
+    commands,
+    format: "utf-8",
+    parser(text) {
+      return text;
+    }
+  };
+}
+function getConfigTask(key, scope) {
+  const commands = ["config", "--null", "--show-origin", "--get-all", key];
+  if (scope) {
+    commands.splice(1, 0, `--${scope}`);
+  }
+  return {
+    commands,
+    format: "utf-8",
+    parser(text) {
+      return configGetParser(text, key);
+    }
+  };
+}
+function listConfigTask(scope) {
+  const commands = ["config", "--list", "--show-origin", "--null"];
+  if (scope) {
+    commands.push(`--${scope}`);
+  }
+  return {
+    commands,
+    format: "utf-8",
+    parser(text) {
+      return configListParser(text);
+    }
+  };
+}
+function config_default() {
+  return {
+    addConfig(key, value, ...rest) {
+      return this._runTask(
+        addConfigTask(
+          key,
+          value,
+          rest[0] === true,
+          asConfigScope(rest[1], "local" /* local */)
+        ),
+        trailingFunctionArgument(arguments)
+      );
+    },
+    getConfig(key, scope) {
+      return this._runTask(
+        getConfigTask(key, asConfigScope(scope, void 0)),
+        trailingFunctionArgument(arguments)
+      );
+    },
+    listConfig(...rest) {
+      return this._runTask(
+        listConfigTask(asConfigScope(rest[0], void 0)),
+        trailingFunctionArgument(arguments)
+      );
+    }
+  };
+}
+var GitConfigScope;
+var init_config = __esm({
+  "src/lib/tasks/config.ts"() {
+    "use strict";
+    init_ConfigList();
+    init_utils();
+    GitConfigScope = /* @__PURE__ */ ((GitConfigScope2) => {
+      GitConfigScope2["system"] = "system";
+      GitConfigScope2["global"] = "global";
+      GitConfigScope2["local"] = "local";
+      GitConfigScope2["worktree"] = "worktree";
+      return GitConfigScope2;
+    })(GitConfigScope || {});
+  }
+});
+
+// src/lib/tasks/diff-name-status.ts
+function isDiffNameStatus(input) {
+  return diffNameStatus.has(input);
+}
+var DiffNameStatus, diffNameStatus;
+var init_diff_name_status = __esm({
+  "src/lib/tasks/diff-name-status.ts"() {
+    "use strict";
+    DiffNameStatus = /* @__PURE__ */ ((DiffNameStatus2) => {
+      DiffNameStatus2["ADDED"] = "A";
+      DiffNameStatus2["COPIED"] = "C";
+      DiffNameStatus2["DELETED"] = "D";
+      DiffNameStatus2["MODIFIED"] = "M";
+      DiffNameStatus2["RENAMED"] = "R";
+      DiffNameStatus2["CHANGED"] = "T";
+      DiffNameStatus2["UNMERGED"] = "U";
+      DiffNameStatus2["UNKNOWN"] = "X";
+      DiffNameStatus2["BROKEN"] = "B";
+      return DiffNameStatus2;
+    })(DiffNameStatus || {});
+    diffNameStatus = new Set(Object.values(DiffNameStatus));
+  }
+});
+
+// src/lib/tasks/grep.ts
+function grepQueryBuilder(...params) {
+  return new GrepQuery().param(...params);
+}
+function parseGrep(grep) {
+  const paths = /* @__PURE__ */ new Set();
+  const results = {};
+  forEachLineWithContent(grep, (input) => {
+    const [path, line, preview] = input.split(NULL);
+    paths.add(path);
+    (results[path] = results[path] || []).push({
+      line: asNumber(line),
+      path,
+      preview
+    });
+  });
+  return {
+    paths,
+    results
+  };
+}
+function grep_default() {
+  return {
+    grep(searchTerm) {
+      const then = trailingFunctionArgument(arguments);
+      const options = getTrailingOptions(arguments);
+      for (const option of disallowedOptions) {
+        if (options.includes(option)) {
+          return this._runTask(
+            configurationErrorTask(`git.grep: use of "${option}" is not supported.`),
+            then
+          );
+        }
+      }
+      if (typeof searchTerm === "string") {
+        searchTerm = grepQueryBuilder().param(searchTerm);
+      }
+      const commands = ["grep", "--null", "-n", "--full-name", ...options, ...searchTerm];
+      return this._runTask(
+        {
+          commands,
+          format: "utf-8",
+          parser(stdOut) {
+            return parseGrep(stdOut);
+          }
+        },
+        then
+      );
+    }
+  };
+}
+var disallowedOptions, Query, _a, GrepQuery;
+var init_grep = __esm({
+  "src/lib/tasks/grep.ts"() {
+    "use strict";
+    init_utils();
+    init_task();
+    disallowedOptions = ["-h"];
+    Query = Symbol("grepQuery");
+    GrepQuery = class {
+      constructor() {
+        this[_a] = [];
+      }
+      *[(_a = Query, Symbol.iterator)]() {
+        for (const query of this[Query]) {
+          yield query;
+        }
+      }
+      and(...and) {
+        and.length && this[Query].push("--and", "(", ...prefixedArray(and, "-e"), ")");
+        return this;
+      }
+      param(...param) {
+        this[Query].push(...prefixedArray(param, "-e"));
+        return this;
+      }
+    };
+  }
+});
+
+// src/lib/tasks/reset.ts
+var reset_exports = {};
+__export(reset_exports, {
+  ResetMode: () => ResetMode,
+  getResetMode: () => getResetMode,
+  resetTask: () => resetTask
+});
+function resetTask(mode, customArgs) {
+  const commands = ["reset"];
+  if (isValidResetMode(mode)) {
+    commands.push(`--${mode}`);
+  }
+  commands.push(...customArgs);
+  return straightThroughStringTask(commands);
+}
+function getResetMode(mode) {
+  if (isValidResetMode(mode)) {
+    return mode;
+  }
+  switch (typeof mode) {
+    case "string":
+    case "undefined":
+      return "soft" /* SOFT */;
+  }
+  return;
+}
+function isValidResetMode(mode) {
+  return ResetModes.includes(mode);
+}
+var ResetMode, ResetModes;
+var init_reset = __esm({
+  "src/lib/tasks/reset.ts"() {
+    "use strict";
+    init_task();
+    ResetMode = /* @__PURE__ */ ((ResetMode2) => {
+      ResetMode2["MIXED"] = "mixed";
+      ResetMode2["SOFT"] = "soft";
+      ResetMode2["HARD"] = "hard";
+      ResetMode2["MERGE"] = "merge";
+      ResetMode2["KEEP"] = "keep";
+      return ResetMode2;
+    })(ResetMode || {});
+    ResetModes = Array.from(Object.values(ResetMode));
+  }
+});
+
+// src/lib/api.ts
+var api_exports = {};
+__export(api_exports, {
+  CheckRepoActions: () => CheckRepoActions,
+  CleanOptions: () => CleanOptions,
+  DiffNameStatus: () => DiffNameStatus,
+  GitConfigScope: () => GitConfigScope,
+  GitConstructError: () => GitConstructError,
+  GitError: () => GitError,
+  GitPluginError: () => GitPluginError,
+  GitResponseError: () => GitResponseError,
+  ResetMode: () => ResetMode,
+  TaskConfigurationError: () => TaskConfigurationError,
+  grepQueryBuilder: () => grepQueryBuilder,
+  pathspec: () => pathspec
+});
+var init_api = __esm({
+  "src/lib/api.ts"() {
+    "use strict";
+    init_pathspec();
+    init_git_construct_error();
+    init_git_error();
+    init_git_plugin_error();
+    init_git_response_error();
+    init_task_configuration_error();
+    init_check_is_repo();
+    init_clean();
+    init_config();
+    init_diff_name_status();
+    init_grep();
+    init_reset();
+  }
+});
+
+// src/lib/plugins/abort-plugin.ts
+function abortPlugin(signal) {
+  if (!signal) {
+    return;
+  }
+  const onSpawnAfter = {
+    type: "spawn.after",
+    action(_data, context) {
+      function kill() {
+        context.kill(new GitPluginError(void 0, "abort", "Abort signal received"));
+      }
+      signal.addEventListener("abort", kill);
+      context.spawned.on("close", () => signal.removeEventListener("abort", kill));
+    }
+  };
+  const onSpawnBefore = {
+    type: "spawn.before",
+    action(_data, context) {
+      if (signal.aborted) {
+        context.kill(new GitPluginError(void 0, "abort", "Abort already signaled"));
+      }
+    }
+  };
+  return [onSpawnBefore, onSpawnAfter];
+}
+var init_abort_plugin = __esm({
+  "src/lib/plugins/abort-plugin.ts"() {
+    "use strict";
+    init_git_plugin_error();
+  }
+});
+
+// src/lib/plugins/block-unsafe-operations-plugin.ts
+function isConfigSwitch(arg) {
+  return typeof arg === "string" && arg.trim().toLowerCase() === "-c";
+}
+function preventProtocolOverride(arg, next) {
+  if (!isConfigSwitch(arg)) {
+    return;
+  }
+  if (!/^\s*protocol(.[a-z]+)?.allow/.test(next)) {
+    return;
+  }
+  throw new GitPluginError(
+    void 0,
+    "unsafe",
+    "Configuring protocol.allow is not permitted without enabling allowUnsafeExtProtocol"
+  );
+}
+function preventUploadPack(arg, method) {
+  if (/^\s*--(upload|receive)-pack/.test(arg)) {
+    throw new GitPluginError(
+      void 0,
+      "unsafe",
+      `Use of --upload-pack or --receive-pack is not permitted without enabling allowUnsafePack`
+    );
+  }
+  if (method === "clone" && /^\s*-u\b/.test(arg)) {
+    throw new GitPluginError(
+      void 0,
+      "unsafe",
+      `Use of clone with option -u is not permitted without enabling allowUnsafePack`
+    );
+  }
+  if (method === "push" && /^\s*--exec\b/.test(arg)) {
+    throw new GitPluginError(
+      void 0,
+      "unsafe",
+      `Use of push with option --exec is not permitted without enabling allowUnsafePack`
+    );
+  }
+}
+function blockUnsafeOperationsPlugin({
+  allowUnsafeProtocolOverride = false,
+  allowUnsafePack = false
+} = {}) {
+  return {
+    type: "spawn.args",
+    action(args, context) {
+      args.forEach((current, index) => {
+        const next = index < args.length ? args[index + 1] : "";
+        allowUnsafeProtocolOverride || preventProtocolOverride(current, next);
+        allowUnsafePack || preventUploadPack(current, context.method);
+      });
+      return args;
+    }
+  };
+}
+var init_block_unsafe_operations_plugin = __esm({
+  "src/lib/plugins/block-unsafe-operations-plugin.ts"() {
+    "use strict";
+    init_git_plugin_error();
+  }
+});
+
+// src/lib/plugins/command-config-prefixing-plugin.ts
+function commandConfigPrefixingPlugin(configuration) {
+  const prefix = prefixedArray(configuration, "-c");
+  return {
+    type: "spawn.args",
+    action(data) {
+      return [...prefix, ...data];
+    }
+  };
+}
+var init_command_config_prefixing_plugin = __esm({
+  "src/lib/plugins/command-config-prefixing-plugin.ts"() {
+    "use strict";
+    init_utils();
+  }
+});
+
+// src/lib/plugins/completion-detection.plugin.ts
+function completionDetectionPlugin({
+  onClose = true,
+  onExit = 50
+} = {}) {
+  function createEvents() {
+    let exitCode = -1;
+    const events = {
+      close: (0, import_promise_deferred.deferred)(),
+      closeTimeout: (0, import_promise_deferred.deferred)(),
+      exit: (0, import_promise_deferred.deferred)(),
+      exitTimeout: (0, import_promise_deferred.deferred)()
+    };
+    const result = Promise.race([
+      onClose === false ? never : events.closeTimeout.promise,
+      onExit === false ? never : events.exitTimeout.promise
+    ]);
+    configureTimeout(onClose, events.close, events.closeTimeout);
+    configureTimeout(onExit, events.exit, events.exitTimeout);
+    return {
+      close(code) {
+        exitCode = code;
+        events.close.done();
+      },
+      exit(code) {
+        exitCode = code;
+        events.exit.done();
+      },
+      get exitCode() {
+        return exitCode;
+      },
+      result
+    };
+  }
+  function configureTimeout(flag, event, timeout) {
+    if (flag === false) {
+      return;
+    }
+    (flag === true ? event.promise : event.promise.then(() => delay(flag))).then(timeout.done);
+  }
+  return {
+    type: "spawn.after",
+    action(_0, _1) {
+      return __async(this, arguments, function* (_data, { spawned, close }) {
+        var _a3, _b;
+        const events = createEvents();
+        let deferClose = true;
+        let quickClose = () => void (deferClose = false);
+        (_a3 = spawned.stdout) == null ? void 0 : _a3.on("data", quickClose);
+        (_b = spawned.stderr) == null ? void 0 : _b.on("data", quickClose);
+        spawned.on("error", quickClose);
+        spawned.on("close", (code) => events.close(code));
+        spawned.on("exit", (code) => events.exit(code));
+        try {
+          yield events.result;
+          if (deferClose) {
+            yield delay(50);
+          }
+          close(events.exitCode);
+        } catch (err) {
+          close(events.exitCode, err);
+        }
+      });
+    }
+  };
+}
+var import_promise_deferred, never;
+var init_completion_detection_plugin = __esm({
+  "src/lib/plugins/completion-detection.plugin.ts"() {
+    "use strict";
+    import_promise_deferred = __nccwpck_require__(9819);
+    init_utils();
+    never = (0, import_promise_deferred.deferred)().promise;
+  }
+});
+
+// src/lib/plugins/custom-binary.plugin.ts
+function isBadArgument(arg) {
+  return !arg || !/^([a-z]:)?([a-z0-9/.\\_-]+)$/i.test(arg);
+}
+function toBinaryConfig(input, allowUnsafe) {
+  if (input.length < 1 || input.length > 2) {
+    throw new GitPluginError(void 0, "binary", WRONG_NUMBER_ERR);
+  }
+  const isBad = input.some(isBadArgument);
+  if (isBad) {
+    if (allowUnsafe) {
+      console.warn(WRONG_CHARS_ERR);
+    } else {
+      throw new GitPluginError(void 0, "binary", WRONG_CHARS_ERR);
+    }
+  }
+  const [binary, prefix] = input;
+  return {
+    binary,
+    prefix
+  };
+}
+function customBinaryPlugin(plugins, input = ["git"], allowUnsafe = false) {
+  let config = toBinaryConfig(asArray(input), allowUnsafe);
+  plugins.on("binary", (input2) => {
+    config = toBinaryConfig(asArray(input2), allowUnsafe);
+  });
+  plugins.append("spawn.binary", () => {
+    return config.binary;
+  });
+  plugins.append("spawn.args", (data) => {
+    return config.prefix ? [config.prefix, ...data] : data;
+  });
+}
+var WRONG_NUMBER_ERR, WRONG_CHARS_ERR;
+var init_custom_binary_plugin = __esm({
+  "src/lib/plugins/custom-binary.plugin.ts"() {
+    "use strict";
+    init_git_plugin_error();
+    init_utils();
+    WRONG_NUMBER_ERR = `Invalid value supplied for custom binary, requires a single string or an array containing either one or two strings`;
+    WRONG_CHARS_ERR = `Invalid value supplied for custom binary, restricted characters must be removed or supply the unsafe.allowUnsafeCustomBinary option`;
+  }
+});
+
+// src/lib/plugins/error-detection.plugin.ts
+function isTaskError(result) {
+  return !!(result.exitCode && result.stdErr.length);
+}
+function getErrorMessage(result) {
+  return Buffer.concat([...result.stdOut, ...result.stdErr]);
+}
+function errorDetectionHandler(overwrite = false, isError = isTaskError, errorMessage = getErrorMessage) {
+  return (error, result) => {
+    if (!overwrite && error || !isError(result)) {
+      return error;
+    }
+    return errorMessage(result);
+  };
+}
+function errorDetectionPlugin(config) {
+  return {
+    type: "task.error",
+    action(data, context) {
+      const error = config(data.error, {
+        stdErr: context.stdErr,
+        stdOut: context.stdOut,
+        exitCode: context.exitCode
+      });
+      if (Buffer.isBuffer(error)) {
+        return { error: new GitError(void 0, error.toString("utf-8")) };
+      }
+      return {
+        error
+      };
+    }
+  };
+}
+var init_error_detection_plugin = __esm({
+  "src/lib/plugins/error-detection.plugin.ts"() {
+    "use strict";
+    init_git_error();
+  }
+});
+
+// src/lib/plugins/plugin-store.ts
+var import_node_events, PluginStore;
+var init_plugin_store = __esm({
+  "src/lib/plugins/plugin-store.ts"() {
+    "use strict";
+    import_node_events = __nccwpck_require__(5673);
+    init_utils();
+    PluginStore = class {
+      constructor() {
+        this.plugins = /* @__PURE__ */ new Set();
+        this.events = new import_node_events.EventEmitter();
+      }
+      on(type, listener) {
+        this.events.on(type, listener);
+      }
+      reconfigure(type, data) {
+        this.events.emit(type, data);
+      }
+      append(type, action) {
+        const plugin = append(this.plugins, { type, action });
+        return () => this.plugins.delete(plugin);
+      }
+      add(plugin) {
+        const plugins = [];
+        asArray(plugin).forEach((plugin2) => plugin2 && this.plugins.add(append(plugins, plugin2)));
+        return () => {
+          plugins.forEach((plugin2) => this.plugins.delete(plugin2));
+        };
+      }
+      exec(type, data, context) {
+        let output = data;
+        const contextual = Object.freeze(Object.create(context));
+        for (const plugin of this.plugins) {
+          if (plugin.type === type) {
+            output = plugin.action(output, contextual);
+          }
+        }
+        return output;
+      }
+    };
+  }
+});
+
+// src/lib/plugins/progress-monitor-plugin.ts
+function progressMonitorPlugin(progress) {
+  const progressCommand = "--progress";
+  const progressMethods = ["checkout", "clone", "fetch", "pull", "push"];
+  const onProgress = {
+    type: "spawn.after",
+    action(_data, context) {
+      var _a2;
+      if (!context.commands.includes(progressCommand)) {
+        return;
+      }
+      (_a2 = context.spawned.stderr) == null ? void 0 : _a2.on("data", (chunk) => {
+        const message = /^([\s\S]+?):\s*(\d+)% \((\d+)\/(\d+)\)/.exec(chunk.toString("utf8"));
+        if (!message) {
+          return;
+        }
+        progress({
+          method: context.method,
+          stage: progressEventStage(message[1]),
+          progress: asNumber(message[2]),
+          processed: asNumber(message[3]),
+          total: asNumber(message[4])
+        });
+      });
+    }
+  };
+  const onArgs = {
+    type: "spawn.args",
+    action(args, context) {
+      if (!progressMethods.includes(context.method)) {
+        return args;
+      }
+      return including(args, progressCommand);
+    }
+  };
+  return [onArgs, onProgress];
+}
+function progressEventStage(input) {
+  return String(input.toLowerCase().split(" ", 1)) || "unknown";
+}
+var init_progress_monitor_plugin = __esm({
+  "src/lib/plugins/progress-monitor-plugin.ts"() {
+    "use strict";
+    init_utils();
+  }
+});
+
+// src/lib/plugins/simple-git-plugin.ts
+var init_simple_git_plugin = __esm({
+  "src/lib/plugins/simple-git-plugin.ts"() {
+    "use strict";
+  }
+});
+
+// src/lib/plugins/spawn-options-plugin.ts
+function spawnOptionsPlugin(spawnOptions) {
+  const options = pick(spawnOptions, ["uid", "gid"]);
+  return {
+    type: "spawn.options",
+    action(data) {
+      return __spreadValues(__spreadValues({}, options), data);
+    }
+  };
+}
+var init_spawn_options_plugin = __esm({
+  "src/lib/plugins/spawn-options-plugin.ts"() {
+    "use strict";
+    init_utils();
+  }
+});
+
+// src/lib/plugins/timout-plugin.ts
+function timeoutPlugin({
+  block,
+  stdErr = true,
+  stdOut = true
+}) {
+  if (block > 0) {
+    return {
+      type: "spawn.after",
+      action(_data, context) {
+        var _a2, _b;
+        let timeout;
+        function wait() {
+          timeout && clearTimeout(timeout);
+          timeout = setTimeout(kill, block);
+        }
+        function stop() {
+          var _a3, _b2;
+          (_a3 = context.spawned.stdout) == null ? void 0 : _a3.off("data", wait);
+          (_b2 = context.spawned.stderr) == null ? void 0 : _b2.off("data", wait);
+          context.spawned.off("exit", stop);
+          context.spawned.off("close", stop);
+          timeout && clearTimeout(timeout);
+        }
+        function kill() {
+          stop();
+          context.kill(new GitPluginError(void 0, "timeout", `block timeout reached`));
+        }
+        stdOut && ((_a2 = context.spawned.stdout) == null ? void 0 : _a2.on("data", wait));
+        stdErr && ((_b = context.spawned.stderr) == null ? void 0 : _b.on("data", wait));
+        context.spawned.on("exit", stop);
+        context.spawned.on("close", stop);
+        wait();
+      }
+    };
+  }
+}
+var init_timout_plugin = __esm({
+  "src/lib/plugins/timout-plugin.ts"() {
+    "use strict";
+    init_git_plugin_error();
+  }
+});
+
+// src/lib/plugins/index.ts
+var init_plugins = __esm({
+  "src/lib/plugins/index.ts"() {
+    "use strict";
+    init_abort_plugin();
+    init_block_unsafe_operations_plugin();
+    init_command_config_prefixing_plugin();
+    init_completion_detection_plugin();
+    init_custom_binary_plugin();
+    init_error_detection_plugin();
+    init_plugin_store();
+    init_progress_monitor_plugin();
+    init_simple_git_plugin();
+    init_spawn_options_plugin();
+    init_timout_plugin();
+  }
+});
+
+// src/lib/plugins/suffix-paths.plugin.ts
+function suffixPathsPlugin() {
+  return {
+    type: "spawn.args",
+    action(data) {
+      const prefix = [];
+      let suffix;
+      function append2(args) {
+        (suffix = suffix || []).push(...args);
+      }
+      for (let i = 0; i < data.length; i++) {
+        const param = data[i];
+        if (isPathSpec(param)) {
+          append2(toPaths(param));
+          continue;
+        }
+        if (param === "--") {
+          append2(
+            data.slice(i + 1).flatMap((item) => isPathSpec(item) && toPaths(item) || item)
+          );
+          break;
+        }
+        prefix.push(param);
+      }
+      return !suffix ? prefix : [...prefix, "--", ...suffix.map(String)];
+    }
+  };
+}
+var init_suffix_paths_plugin = __esm({
+  "src/lib/plugins/suffix-paths.plugin.ts"() {
+    "use strict";
+    init_pathspec();
+  }
+});
+
+// src/lib/git-logger.ts
+function createLog() {
+  return (0, import_debug.default)("simple-git");
+}
+function prefixedLogger(to, prefix, forward) {
+  if (!prefix || !String(prefix).replace(/\s*/, "")) {
+    return !forward ? to : (message, ...args) => {
+      to(message, ...args);
+      forward(message, ...args);
+    };
+  }
+  return (message, ...args) => {
+    to(`%s ${message}`, prefix, ...args);
+    if (forward) {
+      forward(message, ...args);
+    }
+  };
+}
+function childLoggerName(name, childDebugger, { namespace: parentNamespace }) {
+  if (typeof name === "string") {
+    return name;
+  }
+  const childNamespace = childDebugger && childDebugger.namespace || "";
+  if (childNamespace.startsWith(parentNamespace)) {
+    return childNamespace.substr(parentNamespace.length + 1);
+  }
+  return childNamespace || parentNamespace;
+}
+function createLogger(label, verbose, initialStep, infoDebugger = createLog()) {
+  const labelPrefix = label && `[${label}]` || "";
+  const spawned = [];
+  const debugDebugger = typeof verbose === "string" ? infoDebugger.extend(verbose) : verbose;
+  const key = childLoggerName(filterType(verbose, filterString), debugDebugger, infoDebugger);
+  return step(initialStep);
+  function sibling(name, initial) {
+    return append(
+      spawned,
+      createLogger(label, key.replace(/^[^:]+/, name), initial, infoDebugger)
+    );
+  }
+  function step(phase) {
+    const stepPrefix = phase && `[${phase}]` || "";
+    const debug2 = debugDebugger && prefixedLogger(debugDebugger, stepPrefix) || NOOP;
+    const info = prefixedLogger(infoDebugger, `${labelPrefix} ${stepPrefix}`, debug2);
+    return Object.assign(debugDebugger ? debug2 : info, {
+      label,
+      sibling,
+      info,
+      step
+    });
+  }
+}
+var import_debug;
+var init_git_logger = __esm({
+  "src/lib/git-logger.ts"() {
+    "use strict";
+    import_debug = __toESM(__nccwpck_require__(8237));
+    init_utils();
+    import_debug.default.formatters.L = (value) => String(filterHasLength(value) ? value.length : "-");
+    import_debug.default.formatters.B = (value) => {
+      if (Buffer.isBuffer(value)) {
+        return value.toString("utf8");
+      }
+      return objectToString(value);
+    };
+  }
+});
+
+// src/lib/runners/tasks-pending-queue.ts
+var _TasksPendingQueue, TasksPendingQueue;
+var init_tasks_pending_queue = __esm({
+  "src/lib/runners/tasks-pending-queue.ts"() {
+    "use strict";
+    init_git_error();
+    init_git_logger();
+    _TasksPendingQueue = class {
+      constructor(logLabel = "GitExecutor") {
+        this.logLabel = logLabel;
+        this._queue = /* @__PURE__ */ new Map();
+      }
+      withProgress(task) {
+        return this._queue.get(task);
+      }
+      createProgress(task) {
+        const name = _TasksPendingQueue.getName(task.commands[0]);
+        const logger = createLogger(this.logLabel, name);
+        return {
+          task,
+          logger,
+          name
+        };
+      }
+      push(task) {
+        const progress = this.createProgress(task);
+        progress.logger("Adding task to the queue, commands = %o", task.commands);
+        this._queue.set(task, progress);
+        return progress;
+      }
+      fatal(err) {
+        for (const [task, { logger }] of Array.from(this._queue.entries())) {
+          if (task === err.task) {
+            logger.info(`Failed %o`, err);
+            logger(
+              `Fatal exception, any as-yet un-started tasks run through this executor will not be attempted`
+            );
+          } else {
+            logger.info(
+              `A fatal exception occurred in a previous task, the queue has been purged: %o`,
+              err.message
+            );
+          }
+          this.complete(task);
+        }
+        if (this._queue.size !== 0) {
+          throw new Error(`Queue size should be zero after fatal: ${this._queue.size}`);
+        }
+      }
+      complete(task) {
+        const progress = this.withProgress(task);
+        if (progress) {
+          this._queue.delete(task);
+        }
+      }
+      attempt(task) {
+        const progress = this.withProgress(task);
+        if (!progress) {
+          throw new GitError(void 0, "TasksPendingQueue: attempt called for an unknown task");
+        }
+        progress.logger("Starting task");
+        return progress;
+      }
+      static getName(name = "empty") {
+        return `task:${name}:${++_TasksPendingQueue.counter}`;
+      }
+    };
+    TasksPendingQueue = _TasksPendingQueue;
+    TasksPendingQueue.counter = 0;
+  }
+});
+
+// src/lib/runners/git-executor-chain.ts
+function pluginContext(task, commands) {
+  return {
+    method: first(task.commands) || "",
+    commands
+  };
+}
+function onErrorReceived(target, logger) {
+  return (err) => {
+    logger(`[ERROR] child process exception %o`, err);
+    target.push(Buffer.from(String(err.stack), "ascii"));
+  };
+}
+function onDataReceived(target, name, logger, output) {
+  return (buffer) => {
+    logger(`%s received %L bytes`, name, buffer);
+    output(`%B`, buffer);
+    target.push(buffer);
+  };
+}
+var import_child_process, GitExecutorChain;
+var init_git_executor_chain = __esm({
+  "src/lib/runners/git-executor-chain.ts"() {
+    "use strict";
+    import_child_process = __nccwpck_require__(2081);
+    init_git_error();
+    init_task();
+    init_utils();
+    init_tasks_pending_queue();
+    GitExecutorChain = class {
+      constructor(_executor, _scheduler, _plugins) {
+        this._executor = _executor;
+        this._scheduler = _scheduler;
+        this._plugins = _plugins;
+        this._chain = Promise.resolve();
+        this._queue = new TasksPendingQueue();
+      }
+      get cwd() {
+        return this._cwd || this._executor.cwd;
+      }
+      set cwd(cwd) {
+        this._cwd = cwd;
+      }
+      get env() {
+        return this._executor.env;
+      }
+      get outputHandler() {
+        return this._executor.outputHandler;
+      }
+      chain() {
+        return this;
+      }
+      push(task) {
+        this._queue.push(task);
+        return this._chain = this._chain.then(() => this.attemptTask(task));
+      }
+      attemptTask(task) {
+        return __async(this, null, function* () {
+          const onScheduleComplete = yield this._scheduler.next();
+          const onQueueComplete = () => this._queue.complete(task);
+          try {
+            const { logger } = this._queue.attempt(task);
+            return yield isEmptyTask(task) ? this.attemptEmptyTask(task, logger) : this.attemptRemoteTask(task, logger);
+          } catch (e) {
+            throw this.onFatalException(task, e);
+          } finally {
+            onQueueComplete();
+            onScheduleComplete();
+          }
+        });
+      }
+      onFatalException(task, e) {
+        const gitError = e instanceof GitError ? Object.assign(e, { task }) : new GitError(task, e && String(e));
+        this._chain = Promise.resolve();
+        this._queue.fatal(gitError);
+        return gitError;
+      }
+      attemptRemoteTask(task, logger) {
+        return __async(this, null, function* () {
+          const binary = this._plugins.exec("spawn.binary", "", pluginContext(task, task.commands));
+          const args = this._plugins.exec(
+            "spawn.args",
+            [...task.commands],
+            pluginContext(task, task.commands)
+          );
+          const raw = yield this.gitResponse(
+            task,
+            binary,
+            args,
+            this.outputHandler,
+            logger.step("SPAWN")
+          );
+          const outputStreams = yield this.handleTaskData(task, args, raw, logger.step("HANDLE"));
+          logger(`passing response to task's parser as a %s`, task.format);
+          if (isBufferTask(task)) {
+            return callTaskParser(task.parser, outputStreams);
+          }
+          return callTaskParser(task.parser, outputStreams.asStrings());
+        });
+      }
+      attemptEmptyTask(task, logger) {
+        return __async(this, null, function* () {
+          logger(`empty task bypassing child process to call to task's parser`);
+          return task.parser(this);
+        });
+      }
+      handleTaskData(task, args, result, logger) {
+        const { exitCode, rejection, stdOut, stdErr } = result;
+        return new Promise((done, fail) => {
+          logger(`Preparing to handle process response exitCode=%d stdOut=`, exitCode);
+          const { error } = this._plugins.exec(
+            "task.error",
+            { error: rejection },
+            __spreadValues(__spreadValues({}, pluginContext(task, args)), result)
+          );
+          if (error && task.onError) {
+            logger.info(`exitCode=%s handling with custom error handler`);
+            return task.onError(
+              result,
+              error,
+              (newStdOut) => {
+                logger.info(`custom error handler treated as success`);
+                logger(`custom error returned a %s`, objectToString(newStdOut));
+                done(
+                  new GitOutputStreams(
+                    Array.isArray(newStdOut) ? Buffer.concat(newStdOut) : newStdOut,
+                    Buffer.concat(stdErr)
+                  )
+                );
+              },
+              fail
+            );
+          }
+          if (error) {
+            logger.info(
+              `handling as error: exitCode=%s stdErr=%s rejection=%o`,
+              exitCode,
+              stdErr.length,
+              rejection
+            );
+            return fail(error);
+          }
+          logger.info(`retrieving task output complete`);
+          done(new GitOutputStreams(Buffer.concat(stdOut), Buffer.concat(stdErr)));
+        });
+      }
+      gitResponse(task, command, args, outputHandler, logger) {
+        return __async(this, null, function* () {
+          const outputLogger = logger.sibling("output");
+          const spawnOptions = this._plugins.exec(
+            "spawn.options",
+            {
+              cwd: this.cwd,
+              env: this.env,
+              windowsHide: true
+            },
+            pluginContext(task, task.commands)
+          );
+          return new Promise((done) => {
+            const stdOut = [];
+            const stdErr = [];
+            logger.info(`%s %o`, command, args);
+            logger("%O", spawnOptions);
+            let rejection = this._beforeSpawn(task, args);
+            if (rejection) {
+              return done({
+                stdOut,
+                stdErr,
+                exitCode: 9901,
+                rejection
+              });
+            }
+            this._plugins.exec("spawn.before", void 0, __spreadProps(__spreadValues({}, pluginContext(task, args)), {
+              kill(reason) {
+                rejection = reason || rejection;
+              }
+            }));
+            const spawned = (0, import_child_process.spawn)(command, args, spawnOptions);
+            spawned.stdout.on(
+              "data",
+              onDataReceived(stdOut, "stdOut", logger, outputLogger.step("stdOut"))
+            );
+            spawned.stderr.on(
+              "data",
+              onDataReceived(stdErr, "stdErr", logger, outputLogger.step("stdErr"))
+            );
+            spawned.on("error", onErrorReceived(stdErr, logger));
+            if (outputHandler) {
+              logger(`Passing child process stdOut/stdErr to custom outputHandler`);
+              outputHandler(command, spawned.stdout, spawned.stderr, [...args]);
+            }
+            this._plugins.exec("spawn.after", void 0, __spreadProps(__spreadValues({}, pluginContext(task, args)), {
+              spawned,
+              close(exitCode, reason) {
+                done({
+                  stdOut,
+                  stdErr,
+                  exitCode,
+                  rejection: rejection || reason
+                });
+              },
+              kill(reason) {
+                if (spawned.killed) {
+                  return;
+                }
+                rejection = reason;
+                spawned.kill("SIGINT");
+              }
+            }));
+          });
+        });
+      }
+      _beforeSpawn(task, args) {
+        let rejection;
+        this._plugins.exec("spawn.before", void 0, __spreadProps(__spreadValues({}, pluginContext(task, args)), {
+          kill(reason) {
+            rejection = reason || rejection;
+          }
+        }));
+        return rejection;
+      }
+    };
+  }
+});
+
+// src/lib/runners/git-executor.ts
+var git_executor_exports = {};
+__export(git_executor_exports, {
+  GitExecutor: () => GitExecutor
+});
+var GitExecutor;
+var init_git_executor = __esm({
+  "src/lib/runners/git-executor.ts"() {
+    "use strict";
+    init_git_executor_chain();
+    GitExecutor = class {
+      constructor(cwd, _scheduler, _plugins) {
+        this.cwd = cwd;
+        this._scheduler = _scheduler;
+        this._plugins = _plugins;
+        this._chain = new GitExecutorChain(this, this._scheduler, this._plugins);
+      }
+      chain() {
+        return new GitExecutorChain(this, this._scheduler, this._plugins);
+      }
+      push(task) {
+        return this._chain.push(task);
+      }
+    };
+  }
+});
+
+// src/lib/task-callback.ts
+function taskCallback(task, response, callback = NOOP) {
+  const onSuccess = (data) => {
+    callback(null, data);
+  };
+  const onError2 = (err) => {
+    if ((err == null ? void 0 : err.task) === task) {
+      callback(
+        err instanceof GitResponseError ? addDeprecationNoticeToError(err) : err,
+        void 0
+      );
+    }
+  };
+  response.then(onSuccess, onError2);
+}
+function addDeprecationNoticeToError(err) {
+  let log = (name) => {
+    console.warn(
+      `simple-git deprecation notice: accessing GitResponseError.${name} should be GitResponseError.git.${name}, this will no longer be available in version 3`
+    );
+    log = NOOP;
+  };
+  return Object.create(err, Object.getOwnPropertyNames(err.git).reduce(descriptorReducer, {}));
+  function descriptorReducer(all, name) {
+    if (name in err) {
+      return all;
+    }
+    all[name] = {
+      enumerable: false,
+      configurable: false,
+      get() {
+        log(name);
+        return err.git[name];
+      }
+    };
+    return all;
+  }
+}
+var init_task_callback = __esm({
+  "src/lib/task-callback.ts"() {
+    "use strict";
+    init_git_response_error();
+    init_utils();
+  }
+});
+
+// src/lib/tasks/change-working-directory.ts
+function changeWorkingDirectoryTask(directory, root) {
+  return adhocExecTask((instance) => {
+    if (!folderExists(directory)) {
+      throw new Error(`Git.cwd: cannot change to non-directory "${directory}"`);
+    }
+    return (root || instance).cwd = directory;
+  });
+}
+var init_change_working_directory = __esm({
+  "src/lib/tasks/change-working-directory.ts"() {
+    "use strict";
+    init_utils();
+    init_task();
+  }
+});
+
+// src/lib/tasks/checkout.ts
+function checkoutTask(args) {
+  const commands = ["checkout", ...args];
+  if (commands[1] === "-b" && commands.includes("-B")) {
+    commands[1] = remove(commands, "-B");
+  }
+  return straightThroughStringTask(commands);
+}
+function checkout_default() {
+  return {
+    checkout() {
+      return this._runTask(
+        checkoutTask(getTrailingOptions(arguments, 1)),
+        trailingFunctionArgument(arguments)
+      );
+    },
+    checkoutBranch(branchName, startPoint) {
+      return this._runTask(
+        checkoutTask(["-b", branchName, startPoint, ...getTrailingOptions(arguments)]),
+        trailingFunctionArgument(arguments)
+      );
+    },
+    checkoutLocalBranch(branchName) {
+      return this._runTask(
+        checkoutTask(["-b", branchName, ...getTrailingOptions(arguments)]),
+        trailingFunctionArgument(arguments)
+      );
+    }
+  };
+}
+var init_checkout = __esm({
+  "src/lib/tasks/checkout.ts"() {
+    "use strict";
+    init_utils();
+    init_task();
+  }
+});
+
+// src/lib/tasks/count-objects.ts
+function countObjectsResponse() {
+  return {
+    count: 0,
+    garbage: 0,
+    inPack: 0,
+    packs: 0,
+    prunePackable: 0,
+    size: 0,
+    sizeGarbage: 0,
+    sizePack: 0
+  };
+}
+function count_objects_default() {
+  return {
+    countObjects() {
+      return this._runTask({
+        commands: ["count-objects", "--verbose"],
+        format: "utf-8",
+        parser(stdOut) {
+          return parseStringResponse(countObjectsResponse(), [parser2], stdOut);
+        }
+      });
+    }
+  };
+}
+var parser2;
+var init_count_objects = __esm({
+  "src/lib/tasks/count-objects.ts"() {
+    "use strict";
+    init_utils();
+    parser2 = new LineParser(
+      /([a-z-]+): (\d+)$/,
+      (result, [key, value]) => {
+        const property = asCamelCase(key);
+        if (result.hasOwnProperty(property)) {
+          result[property] = asNumber(value);
+        }
+      }
+    );
+  }
+});
+
+// src/lib/parsers/parse-commit.ts
+function parseCommitResult(stdOut) {
+  const result = {
+    author: null,
+    branch: "",
+    commit: "",
+    root: false,
+    summary: {
+      changes: 0,
+      insertions: 0,
+      deletions: 0
+    }
+  };
+  return parseStringResponse(result, parsers, stdOut);
+}
+var parsers;
+var init_parse_commit = __esm({
+  "src/lib/parsers/parse-commit.ts"() {
+    "use strict";
+    init_utils();
+    parsers = [
+      new LineParser(/^\[([^\s]+)( \([^)]+\))? ([^\]]+)/, (result, [branch, root, commit]) => {
+        result.branch = branch;
+        result.commit = commit;
+        result.root = !!root;
+      }),
+      new LineParser(/\s*Author:\s(.+)/i, (result, [author]) => {
+        const parts = author.split("<");
+        const email = parts.pop();
+        if (!email || !email.includes("@")) {
+          return;
+        }
+        result.author = {
+          email: email.substr(0, email.length - 1),
+          name: parts.join("<").trim()
+        };
+      }),
+      new LineParser(
+        /(\d+)[^,]*(?:,\s*(\d+)[^,]*)(?:,\s*(\d+))/g,
+        (result, [changes, insertions, deletions]) => {
+          result.summary.changes = parseInt(changes, 10) || 0;
+          result.summary.insertions = parseInt(insertions, 10) || 0;
+          result.summary.deletions = parseInt(deletions, 10) || 0;
+        }
+      ),
+      new LineParser(
+        /^(\d+)[^,]*(?:,\s*(\d+)[^(]+\(([+-]))?/,
+        (result, [changes, lines, direction]) => {
+          result.summary.changes = parseInt(changes, 10) || 0;
+          const count = parseInt(lines, 10) || 0;
+          if (direction === "-") {
+            result.summary.deletions = count;
+          } else if (direction === "+") {
+            result.summary.insertions = count;
+          }
+        }
+      )
+    ];
+  }
+});
+
+// src/lib/tasks/commit.ts
+function commitTask(message, files, customArgs) {
+  const commands = [
+    "-c",
+    "core.abbrev=40",
+    "commit",
+    ...prefixedArray(message, "-m"),
+    ...files,
+    ...customArgs
+  ];
+  return {
+    commands,
+    format: "utf-8",
+    parser: parseCommitResult
+  };
+}
+function commit_default() {
+  return {
+    commit(message, ...rest) {
+      const next = trailingFunctionArgument(arguments);
+      const task = rejectDeprecatedSignatures(message) || commitTask(
+        asArray(message),
+        asArray(filterType(rest[0], filterStringOrStringArray, [])),
+        [...filterType(rest[1], filterArray, []), ...getTrailingOptions(arguments, 0, true)]
+      );
+      return this._runTask(task, next);
+    }
+  };
+  function rejectDeprecatedSignatures(message) {
+    return !filterStringOrStringArray(message) && configurationErrorTask(
+      `git.commit: requires the commit message to be supplied as a string/string[]`
+    );
+  }
+}
+var init_commit = __esm({
+  "src/lib/tasks/commit.ts"() {
+    "use strict";
+    init_parse_commit();
+    init_utils();
+    init_task();
+  }
+});
+
+// src/lib/tasks/first-commit.ts
+function first_commit_default() {
+  return {
+    firstCommit() {
+      return this._runTask(
+        straightThroughStringTask(["rev-list", "--max-parents=0", "HEAD"], true),
+        trailingFunctionArgument(arguments)
+      );
+    }
+  };
+}
+var init_first_commit = __esm({
+  "src/lib/tasks/first-commit.ts"() {
+    "use strict";
+    init_utils();
+    init_task();
+  }
+});
+
+// src/lib/tasks/hash-object.ts
+function hashObjectTask(filePath, write) {
+  const commands = ["hash-object", filePath];
+  if (write) {
+    commands.push("-w");
+  }
+  return straightThroughStringTask(commands, true);
+}
+var init_hash_object = __esm({
+  "src/lib/tasks/hash-object.ts"() {
+    "use strict";
+    init_task();
+  }
+});
+
+// src/lib/responses/InitSummary.ts
+function parseInit(bare, path, text) {
+  const response = String(text).trim();
+  let result;
+  if (result = initResponseRegex.exec(response)) {
+    return new InitSummary(bare, path, false, result[1]);
+  }
+  if (result = reInitResponseRegex.exec(response)) {
+    return new InitSummary(bare, path, true, result[1]);
+  }
+  let gitDir = "";
+  const tokens = response.split(" ");
+  while (tokens.length) {
+    const token = tokens.shift();
+    if (token === "in") {
+      gitDir = tokens.join(" ");
+      break;
+    }
+  }
+  return new InitSummary(bare, path, /^re/i.test(response), gitDir);
+}
+var InitSummary, initResponseRegex, reInitResponseRegex;
+var init_InitSummary = __esm({
+  "src/lib/responses/InitSummary.ts"() {
+    "use strict";
+    InitSummary = class {
+      constructor(bare, path, existing, gitDir) {
+        this.bare = bare;
+        this.path = path;
+        this.existing = existing;
+        this.gitDir = gitDir;
+      }
+    };
+    initResponseRegex = /^Init.+ repository in (.+)$/;
+    reInitResponseRegex = /^Rein.+ in (.+)$/;
+  }
+});
+
+// src/lib/tasks/init.ts
+function hasBareCommand(command) {
+  return command.includes(bareCommand);
+}
+function initTask(bare = false, path, customArgs) {
+  const commands = ["init", ...customArgs];
+  if (bare && !hasBareCommand(commands)) {
+    commands.splice(1, 0, bareCommand);
+  }
+  return {
+    commands,
+    format: "utf-8",
+    parser(text) {
+      return parseInit(commands.includes("--bare"), path, text);
+    }
+  };
+}
+var bareCommand;
+var init_init = __esm({
+  "src/lib/tasks/init.ts"() {
+    "use strict";
+    init_InitSummary();
+    bareCommand = "--bare";
+  }
+});
+
+// src/lib/args/log-format.ts
+function logFormatFromCommand(customArgs) {
+  for (let i = 0; i < customArgs.length; i++) {
+    const format = logFormatRegex.exec(customArgs[i]);
+    if (format) {
+      return `--${format[1]}`;
+    }
+  }
+  return "" /* NONE */;
+}
+function isLogFormat(customArg) {
+  return logFormatRegex.test(customArg);
+}
+var logFormatRegex;
+var init_log_format = __esm({
+  "src/lib/args/log-format.ts"() {
+    "use strict";
+    logFormatRegex = /^--(stat|numstat|name-only|name-status)(=|$)/;
+  }
+});
+
+// src/lib/responses/DiffSummary.ts
+var DiffSummary;
+var init_DiffSummary = __esm({
+  "src/lib/responses/DiffSummary.ts"() {
+    "use strict";
+    DiffSummary = class {
+      constructor() {
+        this.changed = 0;
+        this.deletions = 0;
+        this.insertions = 0;
+        this.files = [];
+      }
+    };
+  }
+});
+
+// src/lib/parsers/parse-diff-summary.ts
+function getDiffParser(format = "" /* NONE */) {
+  const parser4 = diffSummaryParsers[format];
+  return (stdOut) => parseStringResponse(new DiffSummary(), parser4, stdOut, false);
+}
+var statParser, numStatParser, nameOnlyParser, nameStatusParser, diffSummaryParsers;
+var init_parse_diff_summary = __esm({
+  "src/lib/parsers/parse-diff-summary.ts"() {
+    "use strict";
+    init_log_format();
+    init_DiffSummary();
+    init_diff_name_status();
+    init_utils();
+    statParser = [
+      new LineParser(
+        /^(.+)\s+\|\s+(\d+)(\s+[+\-]+)?$/,
+        (result, [file, changes, alterations = ""]) => {
+          result.files.push({
+            file: file.trim(),
+            changes: asNumber(changes),
+            insertions: alterations.replace(/[^+]/g, "").length,
+            deletions: alterations.replace(/[^-]/g, "").length,
+            binary: false
+          });
+        }
+      ),
+      new LineParser(
+        /^(.+) \|\s+Bin ([0-9.]+) -> ([0-9.]+) ([a-z]+)/,
+        (result, [file, before, after]) => {
+          result.files.push({
+            file: file.trim(),
+            before: asNumber(before),
+            after: asNumber(after),
+            binary: true
+          });
+        }
+      ),
+      new LineParser(
+        /(\d+) files? changed\s*((?:, \d+ [^,]+){0,2})/,
+        (result, [changed, summary]) => {
+          const inserted = /(\d+) i/.exec(summary);
+          const deleted = /(\d+) d/.exec(summary);
+          result.changed = asNumber(changed);
+          result.insertions = asNumber(inserted == null ? void 0 : inserted[1]);
+          result.deletions = asNumber(deleted == null ? void 0 : deleted[1]);
+        }
+      )
+    ];
+    numStatParser = [
+      new LineParser(
+        /(\d+)\t(\d+)\t(.+)$/,
+        (result, [changesInsert, changesDelete, file]) => {
+          const insertions = asNumber(changesInsert);
+          const deletions = asNumber(changesDelete);
+          result.changed++;
+          result.insertions += insertions;
+          result.deletions += deletions;
+          result.files.push({
+            file,
+            changes: insertions + deletions,
+            insertions,
+            deletions,
+            binary: false
+          });
+        }
+      ),
+      new LineParser(/-\t-\t(.+)$/, (result, [file]) => {
+        result.changed++;
+        result.files.push({
+          file,
+          after: 0,
+          before: 0,
+          binary: true
+        });
+      })
+    ];
+    nameOnlyParser = [
+      new LineParser(/(.+)$/, (result, [file]) => {
+        result.changed++;
+        result.files.push({
+          file,
+          changes: 0,
+          insertions: 0,
+          deletions: 0,
+          binary: false
+        });
+      })
+    ];
+    nameStatusParser = [
+      new LineParser(
+        /([ACDMRTUXB])([0-9]{0,3})\t(.[^\t]*)(\t(.[^\t]*))?$/,
+        (result, [status, similarity, from, _to, to]) => {
+          result.changed++;
+          result.files.push({
+            file: to != null ? to : from,
+            changes: 0,
+            insertions: 0,
+            deletions: 0,
+            binary: false,
+            status: orVoid(isDiffNameStatus(status) && status),
+            from: orVoid(!!to && from !== to && from),
+            similarity: asNumber(similarity)
+          });
+        }
+      )
+    ];
+    diffSummaryParsers = {
+      ["" /* NONE */]: statParser,
+      ["--stat" /* STAT */]: statParser,
+      ["--numstat" /* NUM_STAT */]: numStatParser,
+      ["--name-status" /* NAME_STATUS */]: nameStatusParser,
+      ["--name-only" /* NAME_ONLY */]: nameOnlyParser
+    };
+  }
+});
+
+// src/lib/parsers/parse-list-log-summary.ts
+function lineBuilder(tokens, fields) {
+  return fields.reduce(
+    (line, field, index) => {
+      line[field] = tokens[index] || "";
+      return line;
+    },
+    /* @__PURE__ */ Object.create({ diff: null })
+  );
+}
+function createListLogSummaryParser(splitter = SPLITTER, fields = defaultFieldNames, logFormat = "" /* NONE */) {
+  const parseDiffResult = getDiffParser(logFormat);
+  return function(stdOut) {
+    const all = toLinesWithContent(
+      stdOut.trim(),
+      false,
+      START_BOUNDARY
+    ).map(function(item) {
+      const lineDetail = item.split(COMMIT_BOUNDARY);
+      const listLogLine = lineBuilder(lineDetail[0].split(splitter), fields);
+      if (lineDetail.length > 1 && !!lineDetail[1].trim()) {
+        listLogLine.diff = parseDiffResult(lineDetail[1]);
+      }
+      return listLogLine;
+    });
+    return {
+      all,
+      latest: all.length && all[0] || null,
+      total: all.length
+    };
+  };
+}
+var START_BOUNDARY, COMMIT_BOUNDARY, SPLITTER, defaultFieldNames;
+var init_parse_list_log_summary = __esm({
+  "src/lib/parsers/parse-list-log-summary.ts"() {
+    "use strict";
+    init_utils();
+    init_parse_diff_summary();
+    init_log_format();
+    START_BOUNDARY = "\xF2\xF2\xF2\xF2\xF2\xF2 ";
+    COMMIT_BOUNDARY = " \xF2\xF2";
+    SPLITTER = " \xF2 ";
+    defaultFieldNames = ["hash", "date", "message", "refs", "author_name", "author_email"];
+  }
+});
+
+// src/lib/tasks/diff.ts
+var diff_exports = {};
+__export(diff_exports, {
+  diffSummaryTask: () => diffSummaryTask,
+  validateLogFormatConfig: () => validateLogFormatConfig
+});
+function diffSummaryTask(customArgs) {
+  let logFormat = logFormatFromCommand(customArgs);
+  const commands = ["diff"];
+  if (logFormat === "" /* NONE */) {
+    logFormat = "--stat" /* STAT */;
+    commands.push("--stat=4096");
+  }
+  commands.push(...customArgs);
+  return validateLogFormatConfig(commands) || {
+    commands,
+    format: "utf-8",
+    parser: getDiffParser(logFormat)
+  };
+}
+function validateLogFormatConfig(customArgs) {
+  const flags = customArgs.filter(isLogFormat);
+  if (flags.length > 1) {
+    return configurationErrorTask(
+      `Summary flags are mutually exclusive - pick one of ${flags.join(",")}`
+    );
+  }
+  if (flags.length && customArgs.includes("-z")) {
+    return configurationErrorTask(
+      `Summary flag ${flags} parsing is not compatible with null termination option '-z'`
+    );
+  }
+}
+var init_diff = __esm({
+  "src/lib/tasks/diff.ts"() {
+    "use strict";
+    init_log_format();
+    init_parse_diff_summary();
+    init_task();
+  }
+});
+
+// src/lib/tasks/log.ts
+function prettyFormat(format, splitter) {
+  const fields = [];
+  const formatStr = [];
+  Object.keys(format).forEach((field) => {
+    fields.push(field);
+    formatStr.push(String(format[field]));
+  });
+  return [fields, formatStr.join(splitter)];
+}
+function userOptions(input) {
+  return Object.keys(input).reduce((out, key) => {
+    if (!(key in excludeOptions)) {
+      out[key] = input[key];
+    }
+    return out;
+  }, {});
+}
+function parseLogOptions(opt = {}, customArgs = []) {
+  const splitter = filterType(opt.splitter, filterString, SPLITTER);
+  const format = !filterPrimitives(opt.format) && opt.format ? opt.format : {
+    hash: "%H",
+    date: opt.strictDate === false ? "%ai" : "%aI",
+    message: "%s",
+    refs: "%D",
+    body: opt.multiLine ? "%B" : "%b",
+    author_name: opt.mailMap !== false ? "%aN" : "%an",
+    author_email: opt.mailMap !== false ? "%aE" : "%ae"
+  };
+  const [fields, formatStr] = prettyFormat(format, splitter);
+  const suffix = [];
+  const command = [
+    `--pretty=format:${START_BOUNDARY}${formatStr}${COMMIT_BOUNDARY}`,
+    ...customArgs
+  ];
+  const maxCount = opt.n || opt["max-count"] || opt.maxCount;
+  if (maxCount) {
+    command.push(`--max-count=${maxCount}`);
+  }
+  if (opt.from || opt.to) {
+    const rangeOperator = opt.symmetric !== false ? "..." : "..";
+    suffix.push(`${opt.from || ""}${rangeOperator}${opt.to || ""}`);
+  }
+  if (filterString(opt.file)) {
+    command.push("--follow", pathspec(opt.file));
+  }
+  appendTaskOptions(userOptions(opt), command);
+  return {
+    fields,
+    splitter,
+    commands: [...command, ...suffix]
+  };
+}
+function logTask(splitter, fields, customArgs) {
+  const parser4 = createListLogSummaryParser(splitter, fields, logFormatFromCommand(customArgs));
+  return {
+    commands: ["log", ...customArgs],
+    format: "utf-8",
+    parser: parser4
+  };
+}
+function log_default() {
+  return {
+    log(...rest) {
+      const next = trailingFunctionArgument(arguments);
+      const options = parseLogOptions(
+        trailingOptionsArgument(arguments),
+        filterType(arguments[0], filterArray)
+      );
+      const task = rejectDeprecatedSignatures(...rest) || validateLogFormatConfig(options.commands) || createLogTask(options);
+      return this._runTask(task, next);
+    }
+  };
+  function createLogTask(options) {
+    return logTask(options.splitter, options.fields, options.commands);
+  }
+  function rejectDeprecatedSignatures(from, to) {
+    return filterString(from) && filterString(to) && configurationErrorTask(
+      `git.log(string, string) should be replaced with git.log({ from: string, to: string })`
+    );
+  }
+}
+var excludeOptions;
+var init_log = __esm({
+  "src/lib/tasks/log.ts"() {
+    "use strict";
+    init_log_format();
+    init_pathspec();
+    init_parse_list_log_summary();
+    init_utils();
+    init_task();
+    init_diff();
+    excludeOptions = /* @__PURE__ */ ((excludeOptions2) => {
+      excludeOptions2[excludeOptions2["--pretty"] = 0] = "--pretty";
+      excludeOptions2[excludeOptions2["max-count"] = 1] = "max-count";
+      excludeOptions2[excludeOptions2["maxCount"] = 2] = "maxCount";
+      excludeOptions2[excludeOptions2["n"] = 3] = "n";
+      excludeOptions2[excludeOptions2["file"] = 4] = "file";
+      excludeOptions2[excludeOptions2["format"] = 5] = "format";
+      excludeOptions2[excludeOptions2["from"] = 6] = "from";
+      excludeOptions2[excludeOptions2["to"] = 7] = "to";
+      excludeOptions2[excludeOptions2["splitter"] = 8] = "splitter";
+      excludeOptions2[excludeOptions2["symmetric"] = 9] = "symmetric";
+      excludeOptions2[excludeOptions2["mailMap"] = 10] = "mailMap";
+      excludeOptions2[excludeOptions2["multiLine"] = 11] = "multiLine";
+      excludeOptions2[excludeOptions2["strictDate"] = 12] = "strictDate";
+      return excludeOptions2;
+    })(excludeOptions || {});
+  }
+});
+
+// src/lib/responses/MergeSummary.ts
+var MergeSummaryConflict, MergeSummaryDetail;
+var init_MergeSummary = __esm({
+  "src/lib/responses/MergeSummary.ts"() {
+    "use strict";
+    MergeSummaryConflict = class {
+      constructor(reason, file = null, meta) {
+        this.reason = reason;
+        this.file = file;
+        this.meta = meta;
+      }
+      toString() {
+        return `${this.file}:${this.reason}`;
+      }
+    };
+    MergeSummaryDetail = class {
+      constructor() {
+        this.conflicts = [];
+        this.merges = [];
+        this.result = "success";
+      }
+      get failed() {
+        return this.conflicts.length > 0;
+      }
+      get reason() {
+        return this.result;
+      }
+      toString() {
+        if (this.conflicts.length) {
+          return `CONFLICTS: ${this.conflicts.join(", ")}`;
+        }
+        return "OK";
+      }
+    };
+  }
+});
+
+// src/lib/responses/PullSummary.ts
+var PullSummary, PullFailedSummary;
+var init_PullSummary = __esm({
+  "src/lib/responses/PullSummary.ts"() {
+    "use strict";
+    PullSummary = class {
+      constructor() {
+        this.remoteMessages = {
+          all: []
+        };
+        this.created = [];
+        this.deleted = [];
+        this.files = [];
+        this.deletions = {};
+        this.insertions = {};
+        this.summary = {
+          changes: 0,
+          deletions: 0,
+          insertions: 0
+        };
+      }
+    };
+    PullFailedSummary = class {
+      constructor() {
+        this.remote = "";
+        this.hash = {
+          local: "",
+          remote: ""
+        };
+        this.branch = {
+          local: "",
+          remote: ""
+        };
+        this.message = "";
+      }
+      toString() {
+        return this.message;
+      }
+    };
+  }
+});
+
+// src/lib/parsers/parse-remote-objects.ts
+function objectEnumerationResult(remoteMessages) {
+  return remoteMessages.objects = remoteMessages.objects || {
+    compressing: 0,
+    counting: 0,
+    enumerating: 0,
+    packReused: 0,
+    reused: { count: 0, delta: 0 },
+    total: { count: 0, delta: 0 }
+  };
+}
+function asObjectCount(source) {
+  const count = /^\s*(\d+)/.exec(source);
+  const delta = /delta (\d+)/i.exec(source);
+  return {
+    count: asNumber(count && count[1] || "0"),
+    delta: asNumber(delta && delta[1] || "0")
+  };
+}
+var remoteMessagesObjectParsers;
+var init_parse_remote_objects = __esm({
+  "src/lib/parsers/parse-remote-objects.ts"() {
+    "use strict";
+    init_utils();
+    remoteMessagesObjectParsers = [
+      new RemoteLineParser(
+        /^remote:\s*(enumerating|counting|compressing) objects: (\d+),/i,
+        (result, [action, count]) => {
+          const key = action.toLowerCase();
+          const enumeration = objectEnumerationResult(result.remoteMessages);
+          Object.assign(enumeration, { [key]: asNumber(count) });
+        }
+      ),
+      new RemoteLineParser(
+        /^remote:\s*(enumerating|counting|compressing) objects: \d+% \(\d+\/(\d+)\),/i,
+        (result, [action, count]) => {
+          const key = action.toLowerCase();
+          const enumeration = objectEnumerationResult(result.remoteMessages);
+          Object.assign(enumeration, { [key]: asNumber(count) });
+        }
+      ),
+      new RemoteLineParser(
+        /total ([^,]+), reused ([^,]+), pack-reused (\d+)/i,
+        (result, [total, reused, packReused]) => {
+          const objects = objectEnumerationResult(result.remoteMessages);
+          objects.total = asObjectCount(total);
+          objects.reused = asObjectCount(reused);
+          objects.packReused = asNumber(packReused);
+        }
+      )
+    ];
+  }
+});
+
+// src/lib/parsers/parse-remote-messages.ts
+function parseRemoteMessages(_stdOut, stdErr) {
+  return parseStringResponse({ remoteMessages: new RemoteMessageSummary() }, parsers2, stdErr);
+}
+var parsers2, RemoteMessageSummary;
+var init_parse_remote_messages = __esm({
+  "src/lib/parsers/parse-remote-messages.ts"() {
+    "use strict";
+    init_utils();
+    init_parse_remote_objects();
+    parsers2 = [
+      new RemoteLineParser(/^remote:\s*(.+)$/, (result, [text]) => {
+        result.remoteMessages.all.push(text.trim());
+        return false;
+      }),
+      ...remoteMessagesObjectParsers,
+      new RemoteLineParser(
+        [/create a (?:pull|merge) request/i, /\s(https?:\/\/\S+)$/],
+        (result, [pullRequestUrl]) => {
+          result.remoteMessages.pullRequestUrl = pullRequestUrl;
+        }
+      ),
+      new RemoteLineParser(
+        [/found (\d+) vulnerabilities.+\(([^)]+)\)/i, /\s(https?:\/\/\S+)$/],
+        (result, [count, summary, url]) => {
+          result.remoteMessages.vulnerabilities = {
+            count: asNumber(count),
+            summary,
+            url
+          };
+        }
+      )
+    ];
+    RemoteMessageSummary = class {
+      constructor() {
+        this.all = [];
+      }
+    };
+  }
+});
+
+// src/lib/parsers/parse-pull.ts
+function parsePullErrorResult(stdOut, stdErr) {
+  const pullError = parseStringResponse(new PullFailedSummary(), errorParsers, [stdOut, stdErr]);
+  return pullError.message && pullError;
+}
+var FILE_UPDATE_REGEX, SUMMARY_REGEX, ACTION_REGEX, parsers3, errorParsers, parsePullDetail, parsePullResult;
+var init_parse_pull = __esm({
+  "src/lib/parsers/parse-pull.ts"() {
+    "use strict";
+    init_PullSummary();
+    init_utils();
+    init_parse_remote_messages();
+    FILE_UPDATE_REGEX = /^\s*(.+?)\s+\|\s+\d+\s*(\+*)(-*)/;
+    SUMMARY_REGEX = /(\d+)\D+((\d+)\D+\(\+\))?(\D+(\d+)\D+\(-\))?/;
+    ACTION_REGEX = /^(create|delete) mode \d+ (.+)/;
+    parsers3 = [
+      new LineParser(FILE_UPDATE_REGEX, (result, [file, insertions, deletions]) => {
+        result.files.push(file);
+        if (insertions) {
+          result.insertions[file] = insertions.length;
+        }
+        if (deletions) {
+          result.deletions[file] = deletions.length;
+        }
+      }),
+      new LineParser(SUMMARY_REGEX, (result, [changes, , insertions, , deletions]) => {
+        if (insertions !== void 0 || deletions !== void 0) {
+          result.summary.changes = +changes || 0;
+          result.summary.insertions = +insertions || 0;
+          result.summary.deletions = +deletions || 0;
+          return true;
+        }
+        return false;
+      }),
+      new LineParser(ACTION_REGEX, (result, [action, file]) => {
+        append(result.files, file);
+        append(action === "create" ? result.created : result.deleted, file);
+      })
+    ];
+    errorParsers = [
+      new LineParser(/^from\s(.+)$/i, (result, [remote]) => void (result.remote = remote)),
+      new LineParser(/^fatal:\s(.+)$/, (result, [message]) => void (result.message = message)),
+      new LineParser(
+        /([a-z0-9]+)\.\.([a-z0-9]+)\s+(\S+)\s+->\s+(\S+)$/,
+        (result, [hashLocal, hashRemote, branchLocal, branchRemote]) => {
+          result.branch.local = branchLocal;
+          result.hash.local = hashLocal;
+          result.branch.remote = branchRemote;
+          result.hash.remote = hashRemote;
+        }
+      )
+    ];
+    parsePullDetail = (stdOut, stdErr) => {
+      return parseStringResponse(new PullSummary(), parsers3, [stdOut, stdErr]);
+    };
+    parsePullResult = (stdOut, stdErr) => {
+      return Object.assign(
+        new PullSummary(),
+        parsePullDetail(stdOut, stdErr),
+        parseRemoteMessages(stdOut, stdErr)
+      );
+    };
+  }
+});
+
+// src/lib/parsers/parse-merge.ts
+var parsers4, parseMergeResult, parseMergeDetail;
+var init_parse_merge = __esm({
+  "src/lib/parsers/parse-merge.ts"() {
+    "use strict";
+    init_MergeSummary();
+    init_utils();
+    init_parse_pull();
+    parsers4 = [
+      new LineParser(/^Auto-merging\s+(.+)$/, (summary, [autoMerge]) => {
+        summary.merges.push(autoMerge);
+      }),
+      new LineParser(/^CONFLICT\s+\((.+)\): Merge conflict in (.+)$/, (summary, [reason, file]) => {
+        summary.conflicts.push(new MergeSummaryConflict(reason, file));
+      }),
+      new LineParser(
+        /^CONFLICT\s+\((.+\/delete)\): (.+) deleted in (.+) and/,
+        (summary, [reason, file, deleteRef]) => {
+          summary.conflicts.push(new MergeSummaryConflict(reason, file, { deleteRef }));
+        }
+      ),
+      new LineParser(/^CONFLICT\s+\((.+)\):/, (summary, [reason]) => {
+        summary.conflicts.push(new MergeSummaryConflict(reason, null));
+      }),
+      new LineParser(/^Automatic merge failed;\s+(.+)$/, (summary, [result]) => {
+        summary.result = result;
+      })
+    ];
+    parseMergeResult = (stdOut, stdErr) => {
+      return Object.assign(parseMergeDetail(stdOut, stdErr), parsePullResult(stdOut, stdErr));
+    };
+    parseMergeDetail = (stdOut) => {
+      return parseStringResponse(new MergeSummaryDetail(), parsers4, stdOut);
+    };
+  }
+});
+
+// src/lib/tasks/merge.ts
+function mergeTask(customArgs) {
+  if (!customArgs.length) {
+    return configurationErrorTask("Git.merge requires at least one option");
+  }
+  return {
+    commands: ["merge", ...customArgs],
+    format: "utf-8",
+    parser(stdOut, stdErr) {
+      const merge = parseMergeResult(stdOut, stdErr);
+      if (merge.failed) {
+        throw new GitResponseError(merge);
+      }
+      return merge;
+    }
+  };
+}
+var init_merge = __esm({
+  "src/lib/tasks/merge.ts"() {
+    "use strict";
+    init_git_response_error();
+    init_parse_merge();
+    init_task();
+  }
+});
+
+// src/lib/parsers/parse-push.ts
+function pushResultPushedItem(local, remote, status) {
+  const deleted = status.includes("deleted");
+  const tag = status.includes("tag") || /^refs\/tags/.test(local);
+  const alreadyUpdated = !status.includes("new");
+  return {
+    deleted,
+    tag,
+    branch: !tag,
+    new: !alreadyUpdated,
+    alreadyUpdated,
+    local,
+    remote
+  };
+}
+var parsers5, parsePushResult, parsePushDetail;
+var init_parse_push = __esm({
+  "src/lib/parsers/parse-push.ts"() {
+    "use strict";
+    init_utils();
+    init_parse_remote_messages();
+    parsers5 = [
+      new LineParser(/^Pushing to (.+)$/, (result, [repo]) => {
+        result.repo = repo;
+      }),
+      new LineParser(/^updating local tracking ref '(.+)'/, (result, [local]) => {
+        result.ref = __spreadProps(__spreadValues({}, result.ref || {}), {
+          local
+        });
+      }),
+      new LineParser(/^[=*-]\s+([^:]+):(\S+)\s+\[(.+)]$/, (result, [local, remote, type]) => {
+        result.pushed.push(pushResultPushedItem(local, remote, type));
+      }),
+      new LineParser(
+        /^Branch '([^']+)' set up to track remote branch '([^']+)' from '([^']+)'/,
+        (result, [local, remote, remoteName]) => {
+          result.branch = __spreadProps(__spreadValues({}, result.branch || {}), {
+            local,
+            remote,
+            remoteName
+          });
+        }
+      ),
+      new LineParser(
+        /^([^:]+):(\S+)\s+([a-z0-9]+)\.\.([a-z0-9]+)$/,
+        (result, [local, remote, from, to]) => {
+          result.update = {
+            head: {
+              local,
+              remote
+            },
+            hash: {
+              from,
+              to
+            }
+          };
+        }
+      )
+    ];
+    parsePushResult = (stdOut, stdErr) => {
+      const pushDetail = parsePushDetail(stdOut, stdErr);
+      const responseDetail = parseRemoteMessages(stdOut, stdErr);
+      return __spreadValues(__spreadValues({}, pushDetail), responseDetail);
+    };
+    parsePushDetail = (stdOut, stdErr) => {
+      return parseStringResponse({ pushed: [] }, parsers5, [stdOut, stdErr]);
+    };
+  }
+});
+
+// src/lib/tasks/push.ts
+var push_exports = {};
+__export(push_exports, {
+  pushTagsTask: () => pushTagsTask,
+  pushTask: () => pushTask
+});
+function pushTagsTask(ref = {}, customArgs) {
+  append(customArgs, "--tags");
+  return pushTask(ref, customArgs);
+}
+function pushTask(ref = {}, customArgs) {
+  const commands = ["push", ...customArgs];
+  if (ref.branch) {
+    commands.splice(1, 0, ref.branch);
+  }
+  if (ref.remote) {
+    commands.splice(1, 0, ref.remote);
+  }
+  remove(commands, "-v");
+  append(commands, "--verbose");
+  append(commands, "--porcelain");
+  return {
+    commands,
+    format: "utf-8",
+    parser: parsePushResult
+  };
+}
+var init_push = __esm({
+  "src/lib/tasks/push.ts"() {
+    "use strict";
+    init_parse_push();
+    init_utils();
+  }
+});
+
+// src/lib/tasks/show.ts
+function show_default() {
+  return {
+    showBuffer() {
+      const commands = ["show", ...getTrailingOptions(arguments, 1)];
+      if (!commands.includes("--binary")) {
+        commands.splice(1, 0, "--binary");
+      }
+      return this._runTask(
+        straightThroughBufferTask(commands),
+        trailingFunctionArgument(arguments)
+      );
+    },
+    show() {
+      const commands = ["show", ...getTrailingOptions(arguments, 1)];
+      return this._runTask(
+        straightThroughStringTask(commands),
+        trailingFunctionArgument(arguments)
+      );
+    }
+  };
+}
+var init_show = __esm({
+  "src/lib/tasks/show.ts"() {
+    "use strict";
+    init_utils();
+    init_task();
+  }
+});
+
+// src/lib/responses/FileStatusSummary.ts
+var fromPathRegex, FileStatusSummary;
+var init_FileStatusSummary = __esm({
+  "src/lib/responses/FileStatusSummary.ts"() {
+    "use strict";
+    fromPathRegex = /^(.+)\0(.+)$/;
+    FileStatusSummary = class {
+      constructor(path, index, working_dir) {
+        this.path = path;
+        this.index = index;
+        this.working_dir = working_dir;
+        if (index === "R" || working_dir === "R") {
+          const detail = fromPathRegex.exec(path) || [null, path, path];
+          this.from = detail[2] || "";
+          this.path = detail[1] || "";
+        }
+      }
+    };
+  }
+});
+
+// src/lib/responses/StatusSummary.ts
+function renamedFile(line) {
+  const [to, from] = line.split(NULL);
+  return {
+    from: from || to,
+    to
+  };
+}
+function parser3(indexX, indexY, handler) {
+  return [`${indexX}${indexY}`, handler];
+}
+function conflicts(indexX, ...indexY) {
+  return indexY.map((y) => parser3(indexX, y, (result, file) => append(result.conflicted, file)));
+}
+function splitLine(result, lineStr) {
+  const trimmed2 = lineStr.trim();
+  switch (" ") {
+    case trimmed2.charAt(2):
+      return data(trimmed2.charAt(0), trimmed2.charAt(1), trimmed2.substr(3));
+    case trimmed2.charAt(1):
+      return data(" " /* NONE */, trimmed2.charAt(0), trimmed2.substr(2));
+    default:
+      return;
+  }
+  function data(index, workingDir, path) {
+    const raw = `${index}${workingDir}`;
+    const handler = parsers6.get(raw);
+    if (handler) {
+      handler(result, path);
+    }
+    if (raw !== "##" && raw !== "!!") {
+      result.files.push(new FileStatusSummary(path, index, workingDir));
+    }
+  }
+}
+var StatusSummary, parsers6, parseStatusSummary;
+var init_StatusSummary = __esm({
+  "src/lib/responses/StatusSummary.ts"() {
+    "use strict";
+    init_utils();
+    init_FileStatusSummary();
+    StatusSummary = class {
+      constructor() {
+        this.not_added = [];
+        this.conflicted = [];
+        this.created = [];
+        this.deleted = [];
+        this.ignored = void 0;
+        this.modified = [];
+        this.renamed = [];
+        this.files = [];
+        this.staged = [];
+        this.ahead = 0;
+        this.behind = 0;
+        this.current = null;
+        this.tracking = null;
+        this.detached = false;
+        this.isClean = () => {
+          return !this.files.length;
+        };
+      }
+    };
+    parsers6 = new Map([
+      parser3(
+        " " /* NONE */,
+        "A" /* ADDED */,
+        (result, file) => append(result.created, file)
+      ),
+      parser3(
+        " " /* NONE */,
+        "D" /* DELETED */,
+        (result, file) => append(result.deleted, file)
+      ),
+      parser3(
+        " " /* NONE */,
+        "M" /* MODIFIED */,
+        (result, file) => append(result.modified, file)
+      ),
+      parser3(
+        "A" /* ADDED */,
+        " " /* NONE */,
+        (result, file) => append(result.created, file) && append(result.staged, file)
+      ),
+      parser3(
+        "A" /* ADDED */,
+        "M" /* MODIFIED */,
+        (result, file) => append(result.created, file) && append(result.staged, file) && append(result.modified, file)
+      ),
+      parser3(
+        "D" /* DELETED */,
+        " " /* NONE */,
+        (result, file) => append(result.deleted, file) && append(result.staged, file)
+      ),
+      parser3(
+        "M" /* MODIFIED */,
+        " " /* NONE */,
+        (result, file) => append(result.modified, file) && append(result.staged, file)
+      ),
+      parser3(
+        "M" /* MODIFIED */,
+        "M" /* MODIFIED */,
+        (result, file) => append(result.modified, file) && append(result.staged, file)
+      ),
+      parser3("R" /* RENAMED */, " " /* NONE */, (result, file) => {
+        append(result.renamed, renamedFile(file));
+      }),
+      parser3("R" /* RENAMED */, "M" /* MODIFIED */, (result, file) => {
+        const renamed = renamedFile(file);
+        append(result.renamed, renamed);
+        append(result.modified, renamed.to);
+      }),
+      parser3("!" /* IGNORED */, "!" /* IGNORED */, (_result, _file) => {
+        append(_result.ignored = _result.ignored || [], _file);
+      }),
+      parser3(
+        "?" /* UNTRACKED */,
+        "?" /* UNTRACKED */,
+        (result, file) => append(result.not_added, file)
+      ),
+      ...conflicts("A" /* ADDED */, "A" /* ADDED */, "U" /* UNMERGED */),
+      ...conflicts(
+        "D" /* DELETED */,
+        "D" /* DELETED */,
+        "U" /* UNMERGED */
+      ),
+      ...conflicts(
+        "U" /* UNMERGED */,
+        "A" /* ADDED */,
+        "D" /* DELETED */,
+        "U" /* UNMERGED */
+      ),
+      [
+        "##",
+        (result, line) => {
+          const aheadReg = /ahead (\d+)/;
+          const behindReg = /behind (\d+)/;
+          const currentReg = /^(.+?(?=(?:\.{3}|\s|$)))/;
+          const trackingReg = /\.{3}(\S*)/;
+          const onEmptyBranchReg = /\son\s([\S]+)$/;
+          let regexResult;
+          regexResult = aheadReg.exec(line);
+          result.ahead = regexResult && +regexResult[1] || 0;
+          regexResult = behindReg.exec(line);
+          result.behind = regexResult && +regexResult[1] || 0;
+          regexResult = currentReg.exec(line);
+          result.current = regexResult && regexResult[1];
+          regexResult = trackingReg.exec(line);
+          result.tracking = regexResult && regexResult[1];
+          regexResult = onEmptyBranchReg.exec(line);
+          result.current = regexResult && regexResult[1] || result.current;
+          result.detached = /\(no branch\)/.test(line);
+        }
+      ]
+    ]);
+    parseStatusSummary = function(text) {
+      const lines = text.split(NULL);
+      const status = new StatusSummary();
+      for (let i = 0, l = lines.length; i < l; ) {
+        let line = lines[i++].trim();
+        if (!line) {
+          continue;
+        }
+        if (line.charAt(0) === "R" /* RENAMED */) {
+          line += NULL + (lines[i++] || "");
+        }
+        splitLine(status, line);
+      }
+      return status;
+    };
+  }
+});
+
+// src/lib/tasks/status.ts
+function statusTask(customArgs) {
+  const commands = [
+    "status",
+    "--porcelain",
+    "-b",
+    "-u",
+    "--null",
+    ...customArgs.filter((arg) => !ignoredOptions.includes(arg))
+  ];
+  return {
+    format: "utf-8",
+    commands,
+    parser(text) {
+      return parseStatusSummary(text);
+    }
+  };
+}
+var ignoredOptions;
+var init_status = __esm({
+  "src/lib/tasks/status.ts"() {
+    "use strict";
+    init_StatusSummary();
+    ignoredOptions = ["--null", "-z"];
+  }
+});
+
+// src/lib/tasks/version.ts
+function versionResponse(major = 0, minor = 0, patch = 0, agent = "", installed = true) {
+  return Object.defineProperty(
+    {
+      major,
+      minor,
+      patch,
+      agent,
+      installed
+    },
+    "toString",
+    {
+      value() {
+        return `${this.major}.${this.minor}.${this.patch}`;
+      },
+      configurable: false,
+      enumerable: false
+    }
+  );
+}
+function notInstalledResponse() {
+  return versionResponse(0, 0, 0, "", false);
+}
+function version_default() {
+  return {
+    version() {
+      return this._runTask({
+        commands: ["--version"],
+        format: "utf-8",
+        parser: versionParser,
+        onError(result, error, done, fail) {
+          if (result.exitCode === -2 /* NOT_FOUND */) {
+            return done(Buffer.from(NOT_INSTALLED));
+          }
+          fail(error);
+        }
+      });
+    }
+  };
+}
+function versionParser(stdOut) {
+  if (stdOut === NOT_INSTALLED) {
+    return notInstalledResponse();
+  }
+  return parseStringResponse(versionResponse(0, 0, 0, stdOut), parsers7, stdOut);
+}
+var NOT_INSTALLED, parsers7;
+var init_version = __esm({
+  "src/lib/tasks/version.ts"() {
+    "use strict";
+    init_utils();
+    NOT_INSTALLED = "installed=false";
+    parsers7 = [
+      new LineParser(
+        /version (\d+)\.(\d+)\.(\d+)(?:\s*\((.+)\))?/,
+        (result, [major, minor, patch, agent = ""]) => {
+          Object.assign(
+            result,
+            versionResponse(asNumber(major), asNumber(minor), asNumber(patch), agent)
+          );
+        }
+      ),
+      new LineParser(
+        /version (\d+)\.(\d+)\.(\D+)(.+)?$/,
+        (result, [major, minor, patch, agent = ""]) => {
+          Object.assign(result, versionResponse(asNumber(major), asNumber(minor), patch, agent));
+        }
+      )
+    ];
+  }
+});
+
+// src/lib/simple-git-api.ts
+var simple_git_api_exports = {};
+__export(simple_git_api_exports, {
+  SimpleGitApi: () => SimpleGitApi
+});
+var SimpleGitApi;
+var init_simple_git_api = __esm({
+  "src/lib/simple-git-api.ts"() {
+    "use strict";
+    init_task_callback();
+    init_change_working_directory();
+    init_checkout();
+    init_count_objects();
+    init_commit();
+    init_config();
+    init_first_commit();
+    init_grep();
+    init_hash_object();
+    init_init();
+    init_log();
+    init_merge();
+    init_push();
+    init_show();
+    init_status();
+    init_task();
+    init_version();
+    init_utils();
+    SimpleGitApi = class {
+      constructor(_executor) {
+        this._executor = _executor;
+      }
+      _runTask(task, then) {
+        const chain = this._executor.chain();
+        const promise = chain.push(task);
+        if (then) {
+          taskCallback(task, promise, then);
+        }
+        return Object.create(this, {
+          then: { value: promise.then.bind(promise) },
+          catch: { value: promise.catch.bind(promise) },
+          _executor: { value: chain }
+        });
+      }
+      add(files) {
+        return this._runTask(
+          straightThroughStringTask(["add", ...asArray(files)]),
+          trailingFunctionArgument(arguments)
+        );
+      }
+      cwd(directory) {
+        const next = trailingFunctionArgument(arguments);
+        if (typeof directory === "string") {
+          return this._runTask(changeWorkingDirectoryTask(directory, this._executor), next);
+        }
+        if (typeof (directory == null ? void 0 : directory.path) === "string") {
+          return this._runTask(
+            changeWorkingDirectoryTask(
+              directory.path,
+              directory.root && this._executor || void 0
+            ),
+            next
+          );
+        }
+        return this._runTask(
+          configurationErrorTask("Git.cwd: workingDirectory must be supplied as a string"),
+          next
+        );
+      }
+      hashObject(path, write) {
+        return this._runTask(
+          hashObjectTask(path, write === true),
+          trailingFunctionArgument(arguments)
+        );
+      }
+      init(bare) {
+        return this._runTask(
+          initTask(bare === true, this._executor.cwd, getTrailingOptions(arguments)),
+          trailingFunctionArgument(arguments)
+        );
+      }
+      merge() {
+        return this._runTask(
+          mergeTask(getTrailingOptions(arguments)),
+          trailingFunctionArgument(arguments)
+        );
+      }
+      mergeFromTo(remote, branch) {
+        if (!(filterString(remote) && filterString(branch))) {
+          return this._runTask(
+            configurationErrorTask(
+              `Git.mergeFromTo requires that the 'remote' and 'branch' arguments are supplied as strings`
+            )
+          );
+        }
+        return this._runTask(
+          mergeTask([remote, branch, ...getTrailingOptions(arguments)]),
+          trailingFunctionArgument(arguments, false)
+        );
+      }
+      outputHandler(handler) {
+        this._executor.outputHandler = handler;
+        return this;
+      }
+      push() {
+        const task = pushTask(
+          {
+            remote: filterType(arguments[0], filterString),
+            branch: filterType(arguments[1], filterString)
+          },
+          getTrailingOptions(arguments)
+        );
+        return this._runTask(task, trailingFunctionArgument(arguments));
+      }
+      stash() {
+        return this._runTask(
+          straightThroughStringTask(["stash", ...getTrailingOptions(arguments)]),
+          trailingFunctionArgument(arguments)
+        );
+      }
+      status() {
+        return this._runTask(
+          statusTask(getTrailingOptions(arguments)),
+          trailingFunctionArgument(arguments)
+        );
+      }
+    };
+    Object.assign(
+      SimpleGitApi.prototype,
+      checkout_default(),
+      commit_default(),
+      config_default(),
+      count_objects_default(),
+      first_commit_default(),
+      grep_default(),
+      log_default(),
+      show_default(),
+      version_default()
+    );
+  }
+});
+
+// src/lib/runners/scheduler.ts
+var scheduler_exports = {};
+__export(scheduler_exports, {
+  Scheduler: () => Scheduler
+});
+var import_promise_deferred2, createScheduledTask, Scheduler;
+var init_scheduler = __esm({
+  "src/lib/runners/scheduler.ts"() {
+    "use strict";
+    init_utils();
+    import_promise_deferred2 = __nccwpck_require__(9819);
+    init_git_logger();
+    createScheduledTask = (() => {
+      let id = 0;
+      return () => {
+        id++;
+        const { promise, done } = (0, import_promise_deferred2.createDeferred)();
+        return {
+          promise,
+          done,
+          id
+        };
+      };
+    })();
+    Scheduler = class {
+      constructor(concurrency = 2) {
+        this.concurrency = concurrency;
+        this.logger = createLogger("", "scheduler");
+        this.pending = [];
+        this.running = [];
+        this.logger(`Constructed, concurrency=%s`, concurrency);
+      }
+      schedule() {
+        if (!this.pending.length || this.running.length >= this.concurrency) {
+          this.logger(
+            `Schedule attempt ignored, pending=%s running=%s concurrency=%s`,
+            this.pending.length,
+            this.running.length,
+            this.concurrency
+          );
+          return;
+        }
+        const task = append(this.running, this.pending.shift());
+        this.logger(`Attempting id=%s`, task.id);
+        task.done(() => {
+          this.logger(`Completing id=`, task.id);
+          remove(this.running, task);
+          this.schedule();
+        });
+      }
+      next() {
+        const { promise, id } = append(this.pending, createScheduledTask());
+        this.logger(`Scheduling id=%s`, id);
+        this.schedule();
+        return promise;
+      }
+    };
+  }
+});
+
+// src/lib/tasks/apply-patch.ts
+var apply_patch_exports = {};
+__export(apply_patch_exports, {
+  applyPatchTask: () => applyPatchTask
+});
+function applyPatchTask(patches, customArgs) {
+  return straightThroughStringTask(["apply", ...customArgs, ...patches]);
+}
+var init_apply_patch = __esm({
+  "src/lib/tasks/apply-patch.ts"() {
+    "use strict";
+    init_task();
+  }
+});
+
+// src/lib/responses/BranchDeleteSummary.ts
+function branchDeletionSuccess(branch, hash) {
+  return {
+    branch,
+    hash,
+    success: true
+  };
+}
+function branchDeletionFailure(branch) {
+  return {
+    branch,
+    hash: null,
+    success: false
+  };
+}
+var BranchDeletionBatch;
+var init_BranchDeleteSummary = __esm({
+  "src/lib/responses/BranchDeleteSummary.ts"() {
+    "use strict";
+    BranchDeletionBatch = class {
+      constructor() {
+        this.all = [];
+        this.branches = {};
+        this.errors = [];
+      }
+      get success() {
+        return !this.errors.length;
+      }
+    };
+  }
+});
+
+// src/lib/parsers/parse-branch-delete.ts
+function hasBranchDeletionError(data, processExitCode) {
+  return processExitCode === 1 /* ERROR */ && deleteErrorRegex.test(data);
+}
+var deleteSuccessRegex, deleteErrorRegex, parsers8, parseBranchDeletions;
+var init_parse_branch_delete = __esm({
+  "src/lib/parsers/parse-branch-delete.ts"() {
+    "use strict";
+    init_BranchDeleteSummary();
+    init_utils();
+    deleteSuccessRegex = /(\S+)\s+\(\S+\s([^)]+)\)/;
+    deleteErrorRegex = /^error[^']+'([^']+)'/m;
+    parsers8 = [
+      new LineParser(deleteSuccessRegex, (result, [branch, hash]) => {
+        const deletion = branchDeletionSuccess(branch, hash);
+        result.all.push(deletion);
+        result.branches[branch] = deletion;
+      }),
+      new LineParser(deleteErrorRegex, (result, [branch]) => {
+        const deletion = branchDeletionFailure(branch);
+        result.errors.push(deletion);
+        result.all.push(deletion);
+        result.branches[branch] = deletion;
+      })
+    ];
+    parseBranchDeletions = (stdOut, stdErr) => {
+      return parseStringResponse(new BranchDeletionBatch(), parsers8, [stdOut, stdErr]);
+    };
+  }
+});
+
+// src/lib/responses/BranchSummary.ts
+var BranchSummaryResult;
+var init_BranchSummary = __esm({
+  "src/lib/responses/BranchSummary.ts"() {
+    "use strict";
+    BranchSummaryResult = class {
+      constructor() {
+        this.all = [];
+        this.branches = {};
+        this.current = "";
+        this.detached = false;
+      }
+      push(status, detached, name, commit, label) {
+        if (status === "*" /* CURRENT */) {
+          this.detached = detached;
+          this.current = name;
+        }
+        this.all.push(name);
+        this.branches[name] = {
+          current: status === "*" /* CURRENT */,
+          linkedWorkTree: status === "+" /* LINKED */,
+          name,
+          commit,
+          label
+        };
+      }
+    };
+  }
+});
+
+// src/lib/parsers/parse-branch.ts
+function branchStatus(input) {
+  return input ? input.charAt(0) : "";
+}
+function parseBranchSummary(stdOut) {
+  return parseStringResponse(new BranchSummaryResult(), parsers9, stdOut);
+}
+var parsers9;
+var init_parse_branch = __esm({
+  "src/lib/parsers/parse-branch.ts"() {
+    "use strict";
+    init_BranchSummary();
+    init_utils();
+    parsers9 = [
+      new LineParser(
+        /^([*+]\s)?\((?:HEAD )?detached (?:from|at) (\S+)\)\s+([a-z0-9]+)\s(.*)$/,
+        (result, [current, name, commit, label]) => {
+          result.push(branchStatus(current), true, name, commit, label);
+        }
+      ),
+      new LineParser(
+        new RegExp("^([*+]\\s)?(\\S+)\\s+([a-z0-9]+)\\s?(.*)$", "s"),
+        (result, [current, name, commit, label]) => {
+          result.push(branchStatus(current), false, name, commit, label);
+        }
+      )
+    ];
+  }
+});
+
+// src/lib/tasks/branch.ts
+var branch_exports = {};
+__export(branch_exports, {
+  branchLocalTask: () => branchLocalTask,
+  branchTask: () => branchTask,
+  containsDeleteBranchCommand: () => containsDeleteBranchCommand,
+  deleteBranchTask: () => deleteBranchTask,
+  deleteBranchesTask: () => deleteBranchesTask
+});
+function containsDeleteBranchCommand(commands) {
+  const deleteCommands = ["-d", "-D", "--delete"];
+  return commands.some((command) => deleteCommands.includes(command));
+}
+function branchTask(customArgs) {
+  const isDelete = containsDeleteBranchCommand(customArgs);
+  const commands = ["branch", ...customArgs];
+  if (commands.length === 1) {
+    commands.push("-a");
+  }
+  if (!commands.includes("-v")) {
+    commands.splice(1, 0, "-v");
+  }
+  return {
+    format: "utf-8",
+    commands,
+    parser(stdOut, stdErr) {
+      if (isDelete) {
+        return parseBranchDeletions(stdOut, stdErr).all[0];
+      }
+      return parseBranchSummary(stdOut);
+    }
+  };
+}
+function branchLocalTask() {
+  const parser4 = parseBranchSummary;
+  return {
+    format: "utf-8",
+    commands: ["branch", "-v"],
+    parser: parser4
+  };
+}
+function deleteBranchesTask(branches, forceDelete = false) {
+  return {
+    format: "utf-8",
+    commands: ["branch", "-v", forceDelete ? "-D" : "-d", ...branches],
+    parser(stdOut, stdErr) {
+      return parseBranchDeletions(stdOut, stdErr);
+    },
+    onError({ exitCode, stdOut }, error, done, fail) {
+      if (!hasBranchDeletionError(String(error), exitCode)) {
+        return fail(error);
+      }
+      done(stdOut);
+    }
+  };
+}
+function deleteBranchTask(branch, forceDelete = false) {
+  const task = {
+    format: "utf-8",
+    commands: ["branch", "-v", forceDelete ? "-D" : "-d", branch],
+    parser(stdOut, stdErr) {
+      return parseBranchDeletions(stdOut, stdErr).branches[branch];
+    },
+    onError({ exitCode, stdErr, stdOut }, error, _, fail) {
+      if (!hasBranchDeletionError(String(error), exitCode)) {
+        return fail(error);
+      }
+      throw new GitResponseError(
+        task.parser(bufferToString(stdOut), bufferToString(stdErr)),
+        String(error)
+      );
+    }
+  };
+  return task;
+}
+var init_branch = __esm({
+  "src/lib/tasks/branch.ts"() {
+    "use strict";
+    init_git_response_error();
+    init_parse_branch_delete();
+    init_parse_branch();
+    init_utils();
+  }
+});
+
+// src/lib/responses/CheckIgnore.ts
+var parseCheckIgnore;
+var init_CheckIgnore = __esm({
+  "src/lib/responses/CheckIgnore.ts"() {
+    "use strict";
+    parseCheckIgnore = (text) => {
+      return text.split(/\n/g).map((line) => line.trim()).filter((file) => !!file);
+    };
+  }
+});
+
+// src/lib/tasks/check-ignore.ts
+var check_ignore_exports = {};
+__export(check_ignore_exports, {
+  checkIgnoreTask: () => checkIgnoreTask
+});
+function checkIgnoreTask(paths) {
+  return {
+    commands: ["check-ignore", ...paths],
+    format: "utf-8",
+    parser: parseCheckIgnore
+  };
+}
+var init_check_ignore = __esm({
+  "src/lib/tasks/check-ignore.ts"() {
+    "use strict";
+    init_CheckIgnore();
+  }
+});
+
+// src/lib/tasks/clone.ts
+var clone_exports = {};
+__export(clone_exports, {
+  cloneMirrorTask: () => cloneMirrorTask,
+  cloneTask: () => cloneTask
+});
+function disallowedCommand(command) {
+  return /^--upload-pack(=|$)/.test(command);
+}
+function cloneTask(repo, directory, customArgs) {
+  const commands = ["clone", ...customArgs];
+  filterString(repo) && commands.push(repo);
+  filterString(directory) && commands.push(directory);
+  const banned = commands.find(disallowedCommand);
+  if (banned) {
+    return configurationErrorTask(`git.fetch: potential exploit argument blocked.`);
+  }
+  return straightThroughStringTask(commands);
+}
+function cloneMirrorTask(repo, directory, customArgs) {
+  append(customArgs, "--mirror");
+  return cloneTask(repo, directory, customArgs);
+}
+var init_clone = __esm({
+  "src/lib/tasks/clone.ts"() {
+    "use strict";
+    init_task();
+    init_utils();
+  }
+});
+
+// src/lib/parsers/parse-fetch.ts
+function parseFetchResult(stdOut, stdErr) {
+  const result = {
+    raw: stdOut,
+    remote: null,
+    branches: [],
+    tags: [],
+    updated: [],
+    deleted: []
+  };
+  return parseStringResponse(result, parsers10, [stdOut, stdErr]);
+}
+var parsers10;
+var init_parse_fetch = __esm({
+  "src/lib/parsers/parse-fetch.ts"() {
+    "use strict";
+    init_utils();
+    parsers10 = [
+      new LineParser(/From (.+)$/, (result, [remote]) => {
+        result.remote = remote;
+      }),
+      new LineParser(/\* \[new branch]\s+(\S+)\s*-> (.+)$/, (result, [name, tracking]) => {
+        result.branches.push({
+          name,
+          tracking
+        });
+      }),
+      new LineParser(/\* \[new tag]\s+(\S+)\s*-> (.+)$/, (result, [name, tracking]) => {
+        result.tags.push({
+          name,
+          tracking
+        });
+      }),
+      new LineParser(/- \[deleted]\s+\S+\s*-> (.+)$/, (result, [tracking]) => {
+        result.deleted.push({
+          tracking
+        });
+      }),
+      new LineParser(
+        /\s*([^.]+)\.\.(\S+)\s+(\S+)\s*-> (.+)$/,
+        (result, [from, to, name, tracking]) => {
+          result.updated.push({
+            name,
+            tracking,
+            to,
+            from
+          });
+        }
+      )
+    ];
+  }
+});
+
+// src/lib/tasks/fetch.ts
+var fetch_exports = {};
+__export(fetch_exports, {
+  fetchTask: () => fetchTask
+});
+function disallowedCommand2(command) {
+  return /^--upload-pack(=|$)/.test(command);
+}
+function fetchTask(remote, branch, customArgs) {
+  const commands = ["fetch", ...customArgs];
+  if (remote && branch) {
+    commands.push(remote, branch);
+  }
+  const banned = commands.find(disallowedCommand2);
+  if (banned) {
+    return configurationErrorTask(`git.fetch: potential exploit argument blocked.`);
+  }
+  return {
+    commands,
+    format: "utf-8",
+    parser: parseFetchResult
+  };
+}
+var init_fetch = __esm({
+  "src/lib/tasks/fetch.ts"() {
+    "use strict";
+    init_parse_fetch();
+    init_task();
+  }
+});
+
+// src/lib/parsers/parse-move.ts
+function parseMoveResult(stdOut) {
+  return parseStringResponse({ moves: [] }, parsers11, stdOut);
+}
+var parsers11;
+var init_parse_move = __esm({
+  "src/lib/parsers/parse-move.ts"() {
+    "use strict";
+    init_utils();
+    parsers11 = [
+      new LineParser(/^Renaming (.+) to (.+)$/, (result, [from, to]) => {
+        result.moves.push({ from, to });
+      })
+    ];
+  }
+});
+
+// src/lib/tasks/move.ts
+var move_exports = {};
+__export(move_exports, {
+  moveTask: () => moveTask
+});
+function moveTask(from, to) {
+  return {
+    commands: ["mv", "-v", ...asArray(from), to],
+    format: "utf-8",
+    parser: parseMoveResult
+  };
+}
+var init_move = __esm({
+  "src/lib/tasks/move.ts"() {
+    "use strict";
+    init_parse_move();
+    init_utils();
+  }
+});
+
+// src/lib/tasks/pull.ts
+var pull_exports = {};
+__export(pull_exports, {
+  pullTask: () => pullTask
+});
+function pullTask(remote, branch, customArgs) {
+  const commands = ["pull", ...customArgs];
+  if (remote && branch) {
+    commands.splice(1, 0, remote, branch);
+  }
+  return {
+    commands,
+    format: "utf-8",
+    parser(stdOut, stdErr) {
+      return parsePullResult(stdOut, stdErr);
+    },
+    onError(result, _error, _done, fail) {
+      const pullError = parsePullErrorResult(
+        bufferToString(result.stdOut),
+        bufferToString(result.stdErr)
+      );
+      if (pullError) {
+        return fail(new GitResponseError(pullError));
+      }
+      fail(_error);
+    }
+  };
+}
+var init_pull = __esm({
+  "src/lib/tasks/pull.ts"() {
+    "use strict";
+    init_git_response_error();
+    init_parse_pull();
+    init_utils();
+  }
+});
+
+// src/lib/responses/GetRemoteSummary.ts
+function parseGetRemotes(text) {
+  const remotes = {};
+  forEach(text, ([name]) => remotes[name] = { name });
+  return Object.values(remotes);
+}
+function parseGetRemotesVerbose(text) {
+  const remotes = {};
+  forEach(text, ([name, url, purpose]) => {
+    if (!remotes.hasOwnProperty(name)) {
+      remotes[name] = {
+        name,
+        refs: { fetch: "", push: "" }
+      };
+    }
+    if (purpose && url) {
+      remotes[name].refs[purpose.replace(/[^a-z]/g, "")] = url;
+    }
+  });
+  return Object.values(remotes);
+}
+function forEach(text, handler) {
+  forEachLineWithContent(text, (line) => handler(line.split(/\s+/)));
+}
+var init_GetRemoteSummary = __esm({
+  "src/lib/responses/GetRemoteSummary.ts"() {
+    "use strict";
+    init_utils();
+  }
+});
+
+// src/lib/tasks/remote.ts
+var remote_exports = {};
+__export(remote_exports, {
+  addRemoteTask: () => addRemoteTask,
+  getRemotesTask: () => getRemotesTask,
+  listRemotesTask: () => listRemotesTask,
+  remoteTask: () => remoteTask,
+  removeRemoteTask: () => removeRemoteTask
+});
+function addRemoteTask(remoteName, remoteRepo, customArgs) {
+  return straightThroughStringTask(["remote", "add", ...customArgs, remoteName, remoteRepo]);
+}
+function getRemotesTask(verbose) {
+  const commands = ["remote"];
+  if (verbose) {
+    commands.push("-v");
+  }
+  return {
+    commands,
+    format: "utf-8",
+    parser: verbose ? parseGetRemotesVerbose : parseGetRemotes
+  };
+}
+function listRemotesTask(customArgs) {
+  const commands = [...customArgs];
+  if (commands[0] !== "ls-remote") {
+    commands.unshift("ls-remote");
+  }
+  return straightThroughStringTask(commands);
+}
+function remoteTask(customArgs) {
+  const commands = [...customArgs];
+  if (commands[0] !== "remote") {
+    commands.unshift("remote");
+  }
+  return straightThroughStringTask(commands);
+}
+function removeRemoteTask(remoteName) {
+  return straightThroughStringTask(["remote", "remove", remoteName]);
+}
+var init_remote = __esm({
+  "src/lib/tasks/remote.ts"() {
+    "use strict";
+    init_GetRemoteSummary();
+    init_task();
+  }
+});
+
+// src/lib/tasks/stash-list.ts
+var stash_list_exports = {};
+__export(stash_list_exports, {
+  stashListTask: () => stashListTask
+});
+function stashListTask(opt = {}, customArgs) {
+  const options = parseLogOptions(opt);
+  const commands = ["stash", "list", ...options.commands, ...customArgs];
+  const parser4 = createListLogSummaryParser(
+    options.splitter,
+    options.fields,
+    logFormatFromCommand(commands)
+  );
+  return validateLogFormatConfig(commands) || {
+    commands,
+    format: "utf-8",
+    parser: parser4
+  };
+}
+var init_stash_list = __esm({
+  "src/lib/tasks/stash-list.ts"() {
+    "use strict";
+    init_log_format();
+    init_parse_list_log_summary();
+    init_diff();
+    init_log();
+  }
+});
+
+// src/lib/tasks/sub-module.ts
+var sub_module_exports = {};
+__export(sub_module_exports, {
+  addSubModuleTask: () => addSubModuleTask,
+  initSubModuleTask: () => initSubModuleTask,
+  subModuleTask: () => subModuleTask,
+  updateSubModuleTask: () => updateSubModuleTask
+});
+function addSubModuleTask(repo, path) {
+  return subModuleTask(["add", repo, path]);
+}
+function initSubModuleTask(customArgs) {
+  return subModuleTask(["init", ...customArgs]);
+}
+function subModuleTask(customArgs) {
+  const commands = [...customArgs];
+  if (commands[0] !== "submodule") {
+    commands.unshift("submodule");
+  }
+  return straightThroughStringTask(commands);
+}
+function updateSubModuleTask(customArgs) {
+  return subModuleTask(["update", ...customArgs]);
+}
+var init_sub_module = __esm({
+  "src/lib/tasks/sub-module.ts"() {
+    "use strict";
+    init_task();
+  }
+});
+
+// src/lib/responses/TagList.ts
+function singleSorted(a, b) {
+  const aIsNum = isNaN(a);
+  const bIsNum = isNaN(b);
+  if (aIsNum !== bIsNum) {
+    return aIsNum ? 1 : -1;
+  }
+  return aIsNum ? sorted(a, b) : 0;
+}
+function sorted(a, b) {
+  return a === b ? 0 : a > b ? 1 : -1;
+}
+function trimmed(input) {
+  return input.trim();
+}
+function toNumber(input) {
+  if (typeof input === "string") {
+    return parseInt(input.replace(/^\D+/g, ""), 10) || 0;
+  }
+  return 0;
+}
+var TagList, parseTagList;
+var init_TagList = __esm({
+  "src/lib/responses/TagList.ts"() {
+    "use strict";
+    TagList = class {
+      constructor(all, latest) {
+        this.all = all;
+        this.latest = latest;
+      }
+    };
+    parseTagList = function(data, customSort = false) {
+      const tags = data.split("\n").map(trimmed).filter(Boolean);
+      if (!customSort) {
+        tags.sort(function(tagA, tagB) {
+          const partsA = tagA.split(".");
+          const partsB = tagB.split(".");
+          if (partsA.length === 1 || partsB.length === 1) {
+            return singleSorted(toNumber(partsA[0]), toNumber(partsB[0]));
+          }
+          for (let i = 0, l = Math.max(partsA.length, partsB.length); i < l; i++) {
+            const diff = sorted(toNumber(partsA[i]), toNumber(partsB[i]));
+            if (diff) {
+              return diff;
+            }
+          }
+          return 0;
+        });
+      }
+      const latest = customSort ? tags[0] : [...tags].reverse().find((tag) => tag.indexOf(".") >= 0);
+      return new TagList(tags, latest);
+    };
+  }
+});
+
+// src/lib/tasks/tag.ts
+var tag_exports = {};
+__export(tag_exports, {
+  addAnnotatedTagTask: () => addAnnotatedTagTask,
+  addTagTask: () => addTagTask,
+  tagListTask: () => tagListTask
+});
+function tagListTask(customArgs = []) {
+  const hasCustomSort = customArgs.some((option) => /^--sort=/.test(option));
+  return {
+    format: "utf-8",
+    commands: ["tag", "-l", ...customArgs],
+    parser(text) {
+      return parseTagList(text, hasCustomSort);
+    }
+  };
+}
+function addTagTask(name) {
+  return {
+    format: "utf-8",
+    commands: ["tag", name],
+    parser() {
+      return { name };
+    }
+  };
+}
+function addAnnotatedTagTask(name, tagMessage) {
+  return {
+    format: "utf-8",
+    commands: ["tag", "-a", "-m", tagMessage, name],
+    parser() {
+      return { name };
+    }
+  };
+}
+var init_tag = __esm({
+  "src/lib/tasks/tag.ts"() {
+    "use strict";
+    init_TagList();
+  }
+});
+
+// src/git.js
+var require_git = __commonJS({
+  "src/git.js"(exports2, module2) {
+    "use strict";
+    var { GitExecutor: GitExecutor2 } = (init_git_executor(), __toCommonJS(git_executor_exports));
+    var { SimpleGitApi: SimpleGitApi2 } = (init_simple_git_api(), __toCommonJS(simple_git_api_exports));
+    var { Scheduler: Scheduler2 } = (init_scheduler(), __toCommonJS(scheduler_exports));
+    var { configurationErrorTask: configurationErrorTask2 } = (init_task(), __toCommonJS(task_exports));
+    var {
+      asArray: asArray2,
+      filterArray: filterArray2,
+      filterPrimitives: filterPrimitives2,
+      filterString: filterString2,
+      filterStringOrStringArray: filterStringOrStringArray2,
+      filterType: filterType2,
+      getTrailingOptions: getTrailingOptions2,
+      trailingFunctionArgument: trailingFunctionArgument2,
+      trailingOptionsArgument: trailingOptionsArgument2
+    } = (init_utils(), __toCommonJS(utils_exports));
+    var { applyPatchTask: applyPatchTask2 } = (init_apply_patch(), __toCommonJS(apply_patch_exports));
+    var {
+      branchTask: branchTask2,
+      branchLocalTask: branchLocalTask2,
+      deleteBranchesTask: deleteBranchesTask2,
+      deleteBranchTask: deleteBranchTask2
+    } = (init_branch(), __toCommonJS(branch_exports));
+    var { checkIgnoreTask: checkIgnoreTask2 } = (init_check_ignore(), __toCommonJS(check_ignore_exports));
+    var { checkIsRepoTask: checkIsRepoTask2 } = (init_check_is_repo(), __toCommonJS(check_is_repo_exports));
+    var { cloneTask: cloneTask2, cloneMirrorTask: cloneMirrorTask2 } = (init_clone(), __toCommonJS(clone_exports));
+    var { cleanWithOptionsTask: cleanWithOptionsTask2, isCleanOptionsArray: isCleanOptionsArray2 } = (init_clean(), __toCommonJS(clean_exports));
+    var { diffSummaryTask: diffSummaryTask2 } = (init_diff(), __toCommonJS(diff_exports));
+    var { fetchTask: fetchTask2 } = (init_fetch(), __toCommonJS(fetch_exports));
+    var { moveTask: moveTask2 } = (init_move(), __toCommonJS(move_exports));
+    var { pullTask: pullTask2 } = (init_pull(), __toCommonJS(pull_exports));
+    var { pushTagsTask: pushTagsTask2 } = (init_push(), __toCommonJS(push_exports));
+    var {
+      addRemoteTask: addRemoteTask2,
+      getRemotesTask: getRemotesTask2,
+      listRemotesTask: listRemotesTask2,
+      remoteTask: remoteTask2,
+      removeRemoteTask: removeRemoteTask2
+    } = (init_remote(), __toCommonJS(remote_exports));
+    var { getResetMode: getResetMode2, resetTask: resetTask2 } = (init_reset(), __toCommonJS(reset_exports));
+    var { stashListTask: stashListTask2 } = (init_stash_list(), __toCommonJS(stash_list_exports));
+    var {
+      addSubModuleTask: addSubModuleTask2,
+      initSubModuleTask: initSubModuleTask2,
+      subModuleTask: subModuleTask2,
+      updateSubModuleTask: updateSubModuleTask2
+    } = (init_sub_module(), __toCommonJS(sub_module_exports));
+    var { addAnnotatedTagTask: addAnnotatedTagTask2, addTagTask: addTagTask2, tagListTask: tagListTask2 } = (init_tag(), __toCommonJS(tag_exports));
+    var { straightThroughBufferTask: straightThroughBufferTask2, straightThroughStringTask: straightThroughStringTask2 } = (init_task(), __toCommonJS(task_exports));
+    function Git2(options, plugins) {
+      this._plugins = plugins;
+      this._executor = new GitExecutor2(
+        options.baseDir,
+        new Scheduler2(options.maxConcurrentProcesses),
+        plugins
+      );
+      this._trimmed = options.trimmed;
+    }
+    (Git2.prototype = Object.create(SimpleGitApi2.prototype)).constructor = Git2;
+    Git2.prototype.customBinary = function(command) {
+      this._plugins.reconfigure("binary", command);
+      return this;
+    };
+    Git2.prototype.env = function(name, value) {
+      if (arguments.length === 1 && typeof name === "object") {
+        this._executor.env = name;
+      } else {
+        (this._executor.env = this._executor.env || {})[name] = value;
+      }
+      return this;
+    };
+    Git2.prototype.stashList = function(options) {
+      return this._runTask(
+        stashListTask2(
+          trailingOptionsArgument2(arguments) || {},
+          filterArray2(options) && options || []
+        ),
+        trailingFunctionArgument2(arguments)
+      );
+    };
+    function createCloneTask(api, task, repoPath, localPath) {
+      if (typeof repoPath !== "string") {
+        return configurationErrorTask2(`git.${api}() requires a string 'repoPath'`);
+      }
+      return task(repoPath, filterType2(localPath, filterString2), getTrailingOptions2(arguments));
+    }
+    Git2.prototype.clone = function() {
+      return this._runTask(
+        createCloneTask("clone", cloneTask2, ...arguments),
+        trailingFunctionArgument2(arguments)
+      );
+    };
+    Git2.prototype.mirror = function() {
+      return this._runTask(
+        createCloneTask("mirror", cloneMirrorTask2, ...arguments),
+        trailingFunctionArgument2(arguments)
+      );
+    };
+    Git2.prototype.mv = function(from, to) {
+      return this._runTask(moveTask2(from, to), trailingFunctionArgument2(arguments));
+    };
+    Git2.prototype.checkoutLatestTag = function(then) {
+      var git = this;
+      return this.pull(function() {
+        git.tags(function(err, tags) {
+          git.checkout(tags.latest, then);
+        });
+      });
+    };
+    Git2.prototype.pull = function(remote, branch, options, then) {
+      return this._runTask(
+        pullTask2(
+          filterType2(remote, filterString2),
+          filterType2(branch, filterString2),
+          getTrailingOptions2(arguments)
+        ),
+        trailingFunctionArgument2(arguments)
+      );
+    };
+    Git2.prototype.fetch = function(remote, branch) {
+      return this._runTask(
+        fetchTask2(
+          filterType2(remote, filterString2),
+          filterType2(branch, filterString2),
+          getTrailingOptions2(arguments)
+        ),
+        trailingFunctionArgument2(arguments)
+      );
+    };
+    Git2.prototype.silent = function(silence) {
+      console.warn(
+        "simple-git deprecation notice: git.silent: logging should be configured using the `debug` library / `DEBUG` environment variable, this will be an error in version 3"
+      );
+      return this;
+    };
+    Git2.prototype.tags = function(options, then) {
+      return this._runTask(
+        tagListTask2(getTrailingOptions2(arguments)),
+        trailingFunctionArgument2(arguments)
+      );
+    };
+    Git2.prototype.rebase = function() {
+      return this._runTask(
+        straightThroughStringTask2(["rebase", ...getTrailingOptions2(arguments)]),
+        trailingFunctionArgument2(arguments)
+      );
+    };
+    Git2.prototype.reset = function(mode) {
+      return this._runTask(
+        resetTask2(getResetMode2(mode), getTrailingOptions2(arguments)),
+        trailingFunctionArgument2(arguments)
+      );
+    };
+    Git2.prototype.revert = function(commit) {
+      const next = trailingFunctionArgument2(arguments);
+      if (typeof commit !== "string") {
+        return this._runTask(configurationErrorTask2("Commit must be a string"), next);
+      }
+      return this._runTask(
+        straightThroughStringTask2(["revert", ...getTrailingOptions2(arguments, 0, true), commit]),
+        next
+      );
+    };
+    Git2.prototype.addTag = function(name) {
+      const task = typeof name === "string" ? addTagTask2(name) : configurationErrorTask2("Git.addTag requires a tag name");
+      return this._runTask(task, trailingFunctionArgument2(arguments));
+    };
+    Git2.prototype.addAnnotatedTag = function(tagName, tagMessage) {
+      return this._runTask(
+        addAnnotatedTagTask2(tagName, tagMessage),
+        trailingFunctionArgument2(arguments)
+      );
+    };
+    Git2.prototype.deleteLocalBranch = function(branchName, forceDelete, then) {
+      return this._runTask(
+        deleteBranchTask2(branchName, typeof forceDelete === "boolean" ? forceDelete : false),
+        trailingFunctionArgument2(arguments)
+      );
+    };
+    Git2.prototype.deleteLocalBranches = function(branchNames, forceDelete, then) {
+      return this._runTask(
+        deleteBranchesTask2(branchNames, typeof forceDelete === "boolean" ? forceDelete : false),
+        trailingFunctionArgument2(arguments)
+      );
+    };
+    Git2.prototype.branch = function(options, then) {
+      return this._runTask(
+        branchTask2(getTrailingOptions2(arguments)),
+        trailingFunctionArgument2(arguments)
+      );
+    };
+    Git2.prototype.branchLocal = function(then) {
+      return this._runTask(branchLocalTask2(), trailingFunctionArgument2(arguments));
+    };
+    Git2.prototype.raw = function(commands) {
+      const createRestCommands = !Array.isArray(commands);
+      const command = [].slice.call(createRestCommands ? arguments : commands, 0);
+      for (let i = 0; i < command.length && createRestCommands; i++) {
+        if (!filterPrimitives2(command[i])) {
+          command.splice(i, command.length - i);
+          break;
+        }
+      }
+      command.push(...getTrailingOptions2(arguments, 0, true));
+      var next = trailingFunctionArgument2(arguments);
+      if (!command.length) {
+        return this._runTask(
+          configurationErrorTask2("Raw: must supply one or more command to execute"),
+          next
+        );
+      }
+      return this._runTask(straightThroughStringTask2(command, this._trimmed), next);
+    };
+    Git2.prototype.submoduleAdd = function(repo, path, then) {
+      return this._runTask(addSubModuleTask2(repo, path), trailingFunctionArgument2(arguments));
+    };
+    Git2.prototype.submoduleUpdate = function(args, then) {
+      return this._runTask(
+        updateSubModuleTask2(getTrailingOptions2(arguments, true)),
+        trailingFunctionArgument2(arguments)
+      );
+    };
+    Git2.prototype.submoduleInit = function(args, then) {
+      return this._runTask(
+        initSubModuleTask2(getTrailingOptions2(arguments, true)),
+        trailingFunctionArgument2(arguments)
+      );
+    };
+    Git2.prototype.subModule = function(options, then) {
+      return this._runTask(
+        subModuleTask2(getTrailingOptions2(arguments)),
+        trailingFunctionArgument2(arguments)
+      );
+    };
+    Git2.prototype.listRemote = function() {
+      return this._runTask(
+        listRemotesTask2(getTrailingOptions2(arguments)),
+        trailingFunctionArgument2(arguments)
+      );
+    };
+    Git2.prototype.addRemote = function(remoteName, remoteRepo, then) {
+      return this._runTask(
+        addRemoteTask2(remoteName, remoteRepo, getTrailingOptions2(arguments)),
+        trailingFunctionArgument2(arguments)
+      );
+    };
+    Git2.prototype.removeRemote = function(remoteName, then) {
+      return this._runTask(removeRemoteTask2(remoteName), trailingFunctionArgument2(arguments));
+    };
+    Git2.prototype.getRemotes = function(verbose, then) {
+      return this._runTask(getRemotesTask2(verbose === true), trailingFunctionArgument2(arguments));
+    };
+    Git2.prototype.remote = function(options, then) {
+      return this._runTask(
+        remoteTask2(getTrailingOptions2(arguments)),
+        trailingFunctionArgument2(arguments)
+      );
+    };
+    Git2.prototype.tag = function(options, then) {
+      const command = getTrailingOptions2(arguments);
+      if (command[0] !== "tag") {
+        command.unshift("tag");
+      }
+      return this._runTask(straightThroughStringTask2(command), trailingFunctionArgument2(arguments));
+    };
+    Git2.prototype.updateServerInfo = function(then) {
+      return this._runTask(
+        straightThroughStringTask2(["update-server-info"]),
+        trailingFunctionArgument2(arguments)
+      );
+    };
+    Git2.prototype.pushTags = function(remote, then) {
+      const task = pushTagsTask2(
+        { remote: filterType2(remote, filterString2) },
+        getTrailingOptions2(arguments)
+      );
+      return this._runTask(task, trailingFunctionArgument2(arguments));
+    };
+    Git2.prototype.rm = function(files) {
+      return this._runTask(
+        straightThroughStringTask2(["rm", "-f", ...asArray2(files)]),
+        trailingFunctionArgument2(arguments)
+      );
+    };
+    Git2.prototype.rmKeepLocal = function(files) {
+      return this._runTask(
+        straightThroughStringTask2(["rm", "--cached", ...asArray2(files)]),
+        trailingFunctionArgument2(arguments)
+      );
+    };
+    Git2.prototype.catFile = function(options, then) {
+      return this._catFile("utf-8", arguments);
+    };
+    Git2.prototype.binaryCatFile = function() {
+      return this._catFile("buffer", arguments);
+    };
+    Git2.prototype._catFile = function(format, args) {
+      var handler = trailingFunctionArgument2(args);
+      var command = ["cat-file"];
+      var options = args[0];
+      if (typeof options === "string") {
+        return this._runTask(
+          configurationErrorTask2("Git.catFile: options must be supplied as an array of strings"),
+          handler
+        );
+      }
+      if (Array.isArray(options)) {
+        command.push.apply(command, options);
+      }
+      const task = format === "buffer" ? straightThroughBufferTask2(command) : straightThroughStringTask2(command);
+      return this._runTask(task, handler);
+    };
+    Git2.prototype.diff = function(options, then) {
+      const task = filterString2(options) ? configurationErrorTask2(
+        "git.diff: supplying options as a single string is no longer supported, switch to an array of strings"
+      ) : straightThroughStringTask2(["diff", ...getTrailingOptions2(arguments)]);
+      return this._runTask(task, trailingFunctionArgument2(arguments));
+    };
+    Git2.prototype.diffSummary = function() {
+      return this._runTask(
+        diffSummaryTask2(getTrailingOptions2(arguments, 1)),
+        trailingFunctionArgument2(arguments)
+      );
+    };
+    Git2.prototype.applyPatch = function(patches) {
+      const task = !filterStringOrStringArray2(patches) ? configurationErrorTask2(
+        `git.applyPatch requires one or more string patches as the first argument`
+      ) : applyPatchTask2(asArray2(patches), getTrailingOptions2([].slice.call(arguments, 1)));
+      return this._runTask(task, trailingFunctionArgument2(arguments));
+    };
+    Git2.prototype.revparse = function() {
+      const commands = ["rev-parse", ...getTrailingOptions2(arguments, true)];
+      return this._runTask(
+        straightThroughStringTask2(commands, true),
+        trailingFunctionArgument2(arguments)
+      );
+    };
+    Git2.prototype.clean = function(mode, options, then) {
+      const usingCleanOptionsArray = isCleanOptionsArray2(mode);
+      const cleanMode = usingCleanOptionsArray && mode.join("") || filterType2(mode, filterString2) || "";
+      const customArgs = getTrailingOptions2([].slice.call(arguments, usingCleanOptionsArray ? 1 : 0));
+      return this._runTask(
+        cleanWithOptionsTask2(cleanMode, customArgs),
+        trailingFunctionArgument2(arguments)
+      );
+    };
+    Git2.prototype.exec = function(then) {
+      const task = {
+        commands: [],
+        format: "utf-8",
+        parser() {
+          if (typeof then === "function") {
+            then();
+          }
+        }
+      };
+      return this._runTask(task);
+    };
+    Git2.prototype.clearQueue = function() {
+      return this;
+    };
+    Git2.prototype.checkIgnore = function(pathnames, then) {
+      return this._runTask(
+        checkIgnoreTask2(asArray2(filterType2(pathnames, filterStringOrStringArray2, []))),
+        trailingFunctionArgument2(arguments)
+      );
+    };
+    Git2.prototype.checkIsRepo = function(checkType, then) {
+      return this._runTask(
+        checkIsRepoTask2(filterType2(checkType, filterString2)),
+        trailingFunctionArgument2(arguments)
+      );
+    };
+    module2.exports = Git2;
+  }
+});
+
+// src/lib/git-factory.ts
+var git_factory_exports = {};
+__export(git_factory_exports, {
+  esModuleFactory: () => esModuleFactory,
+  gitExportFactory: () => gitExportFactory,
+  gitInstanceFactory: () => gitInstanceFactory
+});
+function esModuleFactory(defaultExport) {
+  return Object.defineProperties(defaultExport, {
+    __esModule: { value: true },
+    default: { value: defaultExport }
+  });
+}
+function gitExportFactory(factory) {
+  return Object.assign(factory.bind(null), api_exports);
+}
+function gitInstanceFactory(baseDir, options) {
+  var _a2;
+  const plugins = new PluginStore();
+  const config = createInstanceConfig(
+    baseDir && (typeof baseDir === "string" ? { baseDir } : baseDir) || {},
+    options
+  );
+  if (!folderExists(config.baseDir)) {
+    throw new GitConstructError(
+      config,
+      `Cannot use simple-git on a directory that does not exist`
+    );
+  }
+  if (Array.isArray(config.config)) {
+    plugins.add(commandConfigPrefixingPlugin(config.config));
+  }
+  plugins.add(blockUnsafeOperationsPlugin(config.unsafe));
+  plugins.add(suffixPathsPlugin());
+  plugins.add(completionDetectionPlugin(config.completion));
+  config.abort && plugins.add(abortPlugin(config.abort));
+  config.progress && plugins.add(progressMonitorPlugin(config.progress));
+  config.timeout && plugins.add(timeoutPlugin(config.timeout));
+  config.spawnOptions && plugins.add(spawnOptionsPlugin(config.spawnOptions));
+  plugins.add(errorDetectionPlugin(errorDetectionHandler(true)));
+  config.errors && plugins.add(errorDetectionPlugin(config.errors));
+  customBinaryPlugin(plugins, config.binary, (_a2 = config.unsafe) == null ? void 0 : _a2.allowUnsafeCustomBinary);
+  return new Git(config, plugins);
+}
+var Git;
+var init_git_factory = __esm({
+  "src/lib/git-factory.ts"() {
+    "use strict";
+    init_api();
+    init_plugins();
+    init_suffix_paths_plugin();
+    init_utils();
+    Git = require_git();
+  }
+});
+
+// src/lib/runners/promise-wrapped.ts
+var promise_wrapped_exports = {};
+__export(promise_wrapped_exports, {
+  gitP: () => gitP
+});
+function gitP(...args) {
+  let git;
+  let chain = Promise.resolve();
+  try {
+    git = gitInstanceFactory(...args);
+  } catch (e) {
+    chain = Promise.reject(e);
+  }
+  function builderReturn() {
+    return promiseApi;
+  }
+  function chainReturn() {
+    return chain;
+  }
+  const promiseApi = [...functionNamesBuilderApi, ...functionNamesPromiseApi].reduce(
+    (api, name) => {
+      const isAsync = functionNamesPromiseApi.includes(name);
+      const valid = isAsync ? asyncWrapper(name, git) : syncWrapper(name, git, api);
+      const alternative = isAsync ? chainReturn : builderReturn;
+      Object.defineProperty(api, name, {
+        enumerable: false,
+        configurable: false,
+        value: git ? valid : alternative
+      });
+      return api;
+    },
+    {}
+  );
+  return promiseApi;
+  function asyncWrapper(fn, git2) {
+    return function(...args2) {
+      if (typeof args2[args2.length] === "function") {
+        throw new TypeError(
+          "Promise interface requires that handlers are not supplied inline, trailing function not allowed in call to " + fn
+        );
+      }
+      return chain.then(function() {
+        return new Promise(function(resolve, reject) {
+          const callback = (err, result) => {
+            if (err) {
+              return reject(toError(err));
+            }
+            resolve(result);
+          };
+          args2.push(callback);
+          git2[fn].apply(git2, args2);
+        });
+      });
+    };
+  }
+  function syncWrapper(fn, git2, api) {
+    return (...args2) => {
+      git2[fn](...args2);
+      return api;
+    };
+  }
+}
+function toError(error) {
+  if (error instanceof Error) {
+    return error;
+  }
+  if (typeof error === "string") {
+    return new Error(error);
+  }
+  return new GitResponseError(error);
+}
+var functionNamesBuilderApi, functionNamesPromiseApi;
+var init_promise_wrapped = __esm({
+  "src/lib/runners/promise-wrapped.ts"() {
+    "use strict";
+    init_git_response_error();
+    init_git_factory();
+    functionNamesBuilderApi = ["customBinary", "env", "outputHandler", "silent"];
+    functionNamesPromiseApi = [
+      "add",
+      "addAnnotatedTag",
+      "addConfig",
+      "addRemote",
+      "addTag",
+      "applyPatch",
+      "binaryCatFile",
+      "branch",
+      "branchLocal",
+      "catFile",
+      "checkIgnore",
+      "checkIsRepo",
+      "checkout",
+      "checkoutBranch",
+      "checkoutLatestTag",
+      "checkoutLocalBranch",
+      "clean",
+      "clone",
+      "commit",
+      "cwd",
+      "deleteLocalBranch",
+      "deleteLocalBranches",
+      "diff",
+      "diffSummary",
+      "exec",
+      "fetch",
+      "getRemotes",
+      "init",
+      "listConfig",
+      "listRemote",
+      "log",
+      "merge",
+      "mergeFromTo",
+      "mirror",
+      "mv",
+      "pull",
+      "push",
+      "pushTags",
+      "raw",
+      "rebase",
+      "remote",
+      "removeRemote",
+      "reset",
+      "revert",
+      "revparse",
+      "rm",
+      "rmKeepLocal",
+      "show",
+      "stash",
+      "stashList",
+      "status",
+      "subModule",
+      "submoduleAdd",
+      "submoduleInit",
+      "submoduleUpdate",
+      "tag",
+      "tags",
+      "updateServerInfo"
+    ];
+  }
+});
+
+// src/index.js
+var { gitP: gitP2 } = (init_promise_wrapped(), __toCommonJS(promise_wrapped_exports));
+var { esModuleFactory: esModuleFactory2, gitInstanceFactory: gitInstanceFactory2, gitExportFactory: gitExportFactory2 } = (init_git_factory(), __toCommonJS(git_factory_exports));
+var simpleGit = esModuleFactory2(gitExportFactory2(gitInstanceFactory2));
+module.exports = Object.assign(simpleGit, { gitP: gitP2, simpleGit });
+//# sourceMappingURL=index.js.map
 
 
 /***/ }),
@@ -8871,32 +18530,6 @@ if (process.env.NODE_DEBUG && /\btunnel\b/.test(process.env.NODE_DEBUG)) {
   debug = function() {};
 }
 exports.debug = debug; // for test
-
-
-/***/ }),
-
-/***/ 5030:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-
-function getUserAgent() {
-  if (typeof navigator === "object" && "userAgent" in navigator) {
-    return navigator.userAgent;
-  }
-
-  if (typeof process === "object" && "version" in process) {
-    return `Node.js/${process.version.substr(1)} (${process.platform}; ${process.arch})`;
-  }
-
-  return "<environment undetectable>";
-}
-
-exports.getUserAgent = getUserAgent;
-//# sourceMappingURL=index.js.map
 
 
 /***/ }),
@@ -15727,50 +25360,18 @@ module.exports.implForWrapper = function (wrapper) {
 
 /***/ }),
 
-/***/ 2940:
-/***/ ((module) => {
-
-// Returns a wrapper function that returns a wrapped callback
-// The wrapper function should do some stuff, and return a
-// presumably different callback function.
-// This makes sure that own properties are retained, so that
-// decorations and such are not lost along the way.
-module.exports = wrappy
-function wrappy (fn, cb) {
-  if (fn && cb) return wrappy(fn)(cb)
-
-  if (typeof fn !== 'function')
-    throw new TypeError('need wrapper function')
-
-  Object.keys(fn).forEach(function (k) {
-    wrapper[k] = fn[k]
-  })
-
-  return wrapper
-
-  function wrapper() {
-    var args = new Array(arguments.length)
-    for (var i = 0; i < args.length; i++) {
-      args[i] = arguments[i]
-    }
-    var ret = fn.apply(this, args)
-    var cb = args[args.length-1]
-    if (typeof ret === 'function' && ret !== cb) {
-      Object.keys(cb).forEach(function (k) {
-        ret[k] = cb[k]
-      })
-    }
-    return ret
-  }
-}
-
-
-/***/ }),
-
 /***/ 2877:
 /***/ ((module) => {
 
 module.exports = eval("require")("encoding");
+
+
+/***/ }),
+
+/***/ 132:
+/***/ ((module) => {
+
+module.exports = eval("require")("supports-color");
 
 
 /***/ }),
@@ -15780,6 +25381,14 @@ module.exports = eval("require")("encoding");
 
 "use strict";
 module.exports = require("assert");
+
+/***/ }),
+
+/***/ 2081:
+/***/ ((module) => {
+
+"use strict";
+module.exports = require("child_process");
 
 /***/ }),
 
@@ -15828,6 +25437,14 @@ module.exports = require("https");
 
 "use strict";
 module.exports = require("net");
+
+/***/ }),
+
+/***/ 5673:
+/***/ ((module) => {
+
+"use strict";
+module.exports = require("node:events");
 
 /***/ }),
 
@@ -15884,6 +25501,14 @@ module.exports = require("stream");
 
 "use strict";
 module.exports = require("tls");
+
+/***/ }),
+
+/***/ 6224:
+/***/ ((module) => {
+
+"use strict";
+module.exports = require("tty");
 
 /***/ }),
 
@@ -16872,1550 +26497,6 @@ function isPlainObject(value) {
 }
 exports["default"] = isPlainObject;
 
-
-/***/ }),
-
-/***/ 5822:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-// translate the various posix character classes into unicode properties
-// this works across all unicode locales
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.parseClass = void 0;
-// { <posix class>: [<translation>, /u flag required, negated]
-const posixClasses = {
-    '[:alnum:]': ['\\p{L}\\p{Nl}\\p{Nd}', true],
-    '[:alpha:]': ['\\p{L}\\p{Nl}', true],
-    '[:ascii:]': ['\\x' + '00-\\x' + '7f', false],
-    '[:blank:]': ['\\p{Zs}\\t', true],
-    '[:cntrl:]': ['\\p{Cc}', true],
-    '[:digit:]': ['\\p{Nd}', true],
-    '[:graph:]': ['\\p{Z}\\p{C}', true, true],
-    '[:lower:]': ['\\p{Ll}', true],
-    '[:print:]': ['\\p{C}', true],
-    '[:punct:]': ['\\p{P}', true],
-    '[:space:]': ['\\p{Z}\\t\\r\\n\\v\\f', true],
-    '[:upper:]': ['\\p{Lu}', true],
-    '[:word:]': ['\\p{L}\\p{Nl}\\p{Nd}\\p{Pc}', true],
-    '[:xdigit:]': ['A-Fa-f0-9', false],
-};
-// only need to escape a few things inside of brace expressions
-// escapes: [ \ ] -
-const braceEscape = (s) => s.replace(/[[\]\\-]/g, '\\$&');
-// escape all regexp magic characters
-const regexpEscape = (s) => s.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&');
-// everything has already been escaped, we just have to join
-const rangesToString = (ranges) => ranges.join('');
-// takes a glob string at a posix brace expression, and returns
-// an equivalent regular expression source, and boolean indicating
-// whether the /u flag needs to be applied, and the number of chars
-// consumed to parse the character class.
-// This also removes out of order ranges, and returns ($.) if the
-// entire class just no good.
-const parseClass = (glob, position) => {
-    const pos = position;
-    /* c8 ignore start */
-    if (glob.charAt(pos) !== '[') {
-        throw new Error('not in a brace expression');
-    }
-    /* c8 ignore stop */
-    const ranges = [];
-    const negs = [];
-    let i = pos + 1;
-    let sawStart = false;
-    let uflag = false;
-    let escaping = false;
-    let negate = false;
-    let endPos = pos;
-    let rangeStart = '';
-    WHILE: while (i < glob.length) {
-        const c = glob.charAt(i);
-        if ((c === '!' || c === '^') && i === pos + 1) {
-            negate = true;
-            i++;
-            continue;
-        }
-        if (c === ']' && sawStart && !escaping) {
-            endPos = i + 1;
-            break;
-        }
-        sawStart = true;
-        if (c === '\\') {
-            if (!escaping) {
-                escaping = true;
-                i++;
-                continue;
-            }
-            // escaped \ char, fall through and treat like normal char
-        }
-        if (c === '[' && !escaping) {
-            // either a posix class, a collation equivalent, or just a [
-            for (const [cls, [unip, u, neg]] of Object.entries(posixClasses)) {
-                if (glob.startsWith(cls, i)) {
-                    // invalid, [a-[] is fine, but not [a-[:alpha]]
-                    if (rangeStart) {
-                        return ['$.', false, glob.length - pos, true];
-                    }
-                    i += cls.length;
-                    if (neg)
-                        negs.push(unip);
-                    else
-                        ranges.push(unip);
-                    uflag = uflag || u;
-                    continue WHILE;
-                }
-            }
-        }
-        // now it's just a normal character, effectively
-        escaping = false;
-        if (rangeStart) {
-            // throw this range away if it's not valid, but others
-            // can still match.
-            if (c > rangeStart) {
-                ranges.push(braceEscape(rangeStart) + '-' + braceEscape(c));
-            }
-            else if (c === rangeStart) {
-                ranges.push(braceEscape(c));
-            }
-            rangeStart = '';
-            i++;
-            continue;
-        }
-        // now might be the start of a range.
-        // can be either c-d or c-] or c<more...>] or c] at this point
-        if (glob.startsWith('-]', i + 1)) {
-            ranges.push(braceEscape(c + '-'));
-            i += 2;
-            continue;
-        }
-        if (glob.startsWith('-', i + 1)) {
-            rangeStart = c;
-            i += 2;
-            continue;
-        }
-        // not the start of a range, just a single character
-        ranges.push(braceEscape(c));
-        i++;
-    }
-    if (endPos < i) {
-        // didn't see the end of the class, not a valid class,
-        // but might still be valid as a literal match.
-        return ['', false, 0, false];
-    }
-    // if we got no ranges and no negates, then we have a range that
-    // cannot possibly match anything, and that poisons the whole glob
-    if (!ranges.length && !negs.length) {
-        return ['$.', false, glob.length - pos, true];
-    }
-    // if we got one positive range, and it's a single character, then that's
-    // not actually a magic pattern, it's just that one literal character.
-    // we should not treat that as "magic", we should just return the literal
-    // character. [_] is a perfectly valid way to escape glob magic chars.
-    if (negs.length === 0 &&
-        ranges.length === 1 &&
-        /^\\?.$/.test(ranges[0]) &&
-        !negate) {
-        const r = ranges[0].length === 2 ? ranges[0].slice(-1) : ranges[0];
-        return [regexpEscape(r), false, endPos - pos, false];
-    }
-    const sranges = '[' + (negate ? '^' : '') + rangesToString(ranges) + ']';
-    const snegs = '[' + (negate ? '' : '^') + rangesToString(negs) + ']';
-    const comb = ranges.length && negs.length
-        ? '(' + sranges + '|' + snegs + ')'
-        : ranges.length
-            ? sranges
-            : snegs;
-    return [comb, uflag, endPos - pos, true];
-};
-exports.parseClass = parseClass;
-//# sourceMappingURL=brace-expressions.js.map
-
-/***/ }),
-
-/***/ 9004:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.escape = void 0;
-/**
- * Escape all magic characters in a glob pattern.
- *
- * If the {@link windowsPathsNoEscape | GlobOptions.windowsPathsNoEscape}
- * option is used, then characters are escaped by wrapping in `[]`, because
- * a magic character wrapped in a character class can only be satisfied by
- * that exact character.  In this mode, `\` is _not_ escaped, because it is
- * not interpreted as a magic character, but instead as a path separator.
- */
-const escape = (s, { windowsPathsNoEscape = false, } = {}) => {
-    // don't need to escape +@! because we escape the parens
-    // that make those magic, and escaping ! as [!] isn't valid,
-    // because [!]] is a valid glob class meaning not ']'.
-    return windowsPathsNoEscape
-        ? s.replace(/[?*()[\]]/g, '[$&]')
-        : s.replace(/[?*()[\]\\]/g, '\\$&');
-};
-exports.escape = escape;
-//# sourceMappingURL=escape.js.map
-
-/***/ }),
-
-/***/ 2002:
-/***/ (function(module, __unused_webpack_exports, __nccwpck_require__) {
-
-"use strict";
-
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
-const index_js_1 = __importDefault(__nccwpck_require__(1953));
-module.exports = Object.assign(index_js_1.default, { default: index_js_1.default, minimatch: index_js_1.default });
-//# sourceMappingURL=index-cjs.js.map
-
-/***/ }),
-
-/***/ 1953:
-/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
-
-"use strict";
-
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.unescape = exports.escape = exports.Minimatch = exports.match = exports.makeRe = exports.braceExpand = exports.defaults = exports.filter = exports.GLOBSTAR = exports.sep = exports.minimatch = void 0;
-const brace_expansion_1 = __importDefault(__nccwpck_require__(3717));
-const brace_expressions_js_1 = __nccwpck_require__(5822);
-const escape_js_1 = __nccwpck_require__(9004);
-const unescape_js_1 = __nccwpck_require__(7305);
-const minimatch = (p, pattern, options = {}) => {
-    assertValidPattern(pattern);
-    // shortcut: comments match nothing.
-    if (!options.nocomment && pattern.charAt(0) === '#') {
-        return false;
-    }
-    return new Minimatch(pattern, options).match(p);
-};
-exports.minimatch = minimatch;
-exports["default"] = exports.minimatch;
-// Optimized checking for the most common glob patterns.
-const starDotExtRE = /^\*+([^+@!?\*\[\(]*)$/;
-const starDotExtTest = (ext) => (f) => !f.startsWith('.') && f.endsWith(ext);
-const starDotExtTestDot = (ext) => (f) => f.endsWith(ext);
-const starDotExtTestNocase = (ext) => {
-    ext = ext.toLowerCase();
-    return (f) => !f.startsWith('.') && f.toLowerCase().endsWith(ext);
-};
-const starDotExtTestNocaseDot = (ext) => {
-    ext = ext.toLowerCase();
-    return (f) => f.toLowerCase().endsWith(ext);
-};
-const starDotStarRE = /^\*+\.\*+$/;
-const starDotStarTest = (f) => !f.startsWith('.') && f.includes('.');
-const starDotStarTestDot = (f) => f !== '.' && f !== '..' && f.includes('.');
-const dotStarRE = /^\.\*+$/;
-const dotStarTest = (f) => f !== '.' && f !== '..' && f.startsWith('.');
-const starRE = /^\*+$/;
-const starTest = (f) => f.length !== 0 && !f.startsWith('.');
-const starTestDot = (f) => f.length !== 0 && f !== '.' && f !== '..';
-const qmarksRE = /^\?+([^+@!?\*\[\(]*)?$/;
-const qmarksTestNocase = ([$0, ext = '']) => {
-    const noext = qmarksTestNoExt([$0]);
-    if (!ext)
-        return noext;
-    ext = ext.toLowerCase();
-    return (f) => noext(f) && f.toLowerCase().endsWith(ext);
-};
-const qmarksTestNocaseDot = ([$0, ext = '']) => {
-    const noext = qmarksTestNoExtDot([$0]);
-    if (!ext)
-        return noext;
-    ext = ext.toLowerCase();
-    return (f) => noext(f) && f.toLowerCase().endsWith(ext);
-};
-const qmarksTestDot = ([$0, ext = '']) => {
-    const noext = qmarksTestNoExtDot([$0]);
-    return !ext ? noext : (f) => noext(f) && f.endsWith(ext);
-};
-const qmarksTest = ([$0, ext = '']) => {
-    const noext = qmarksTestNoExt([$0]);
-    return !ext ? noext : (f) => noext(f) && f.endsWith(ext);
-};
-const qmarksTestNoExt = ([$0]) => {
-    const len = $0.length;
-    return (f) => f.length === len && !f.startsWith('.');
-};
-const qmarksTestNoExtDot = ([$0]) => {
-    const len = $0.length;
-    return (f) => f.length === len && f !== '.' && f !== '..';
-};
-/* c8 ignore start */
-const defaultPlatform = (typeof process === 'object' && process
-    ? (typeof process.env === 'object' &&
-        process.env &&
-        process.env.__MINIMATCH_TESTING_PLATFORM__) ||
-        process.platform
-    : 'posix');
-const path = {
-    win32: { sep: '\\' },
-    posix: { sep: '/' },
-};
-/* c8 ignore stop */
-exports.sep = defaultPlatform === 'win32' ? path.win32.sep : path.posix.sep;
-exports.minimatch.sep = exports.sep;
-exports.GLOBSTAR = Symbol('globstar **');
-exports.minimatch.GLOBSTAR = exports.GLOBSTAR;
-const plTypes = {
-    '!': { open: '(?:(?!(?:', close: '))[^/]*?)' },
-    '?': { open: '(?:', close: ')?' },
-    '+': { open: '(?:', close: ')+' },
-    '*': { open: '(?:', close: ')*' },
-    '@': { open: '(?:', close: ')' },
-};
-// any single thing other than /
-// don't need to escape / when using new RegExp()
-const qmark = '[^/]';
-// * => any number of characters
-const star = qmark + '*?';
-// ** when dots are allowed.  Anything goes, except .. and .
-// not (^ or / followed by one or two dots followed by $ or /),
-// followed by anything, any number of times.
-const twoStarDot = '(?:(?!(?:\\/|^)(?:\\.{1,2})($|\\/)).)*?';
-// not a ^ or / followed by a dot,
-// followed by anything, any number of times.
-const twoStarNoDot = '(?:(?!(?:\\/|^)\\.).)*?';
-// "abc" -> { a:true, b:true, c:true }
-const charSet = (s) => s.split('').reduce((set, c) => {
-    set[c] = true;
-    return set;
-}, {});
-// characters that need to be escaped in RegExp.
-const reSpecials = charSet('().*{}+?[]^$\\!');
-// characters that indicate we have to add the pattern start
-const addPatternStartSet = charSet('[.(');
-const filter = (pattern, options = {}) => (p) => (0, exports.minimatch)(p, pattern, options);
-exports.filter = filter;
-exports.minimatch.filter = exports.filter;
-const ext = (a, b = {}) => Object.assign({}, a, b);
-const defaults = (def) => {
-    if (!def || typeof def !== 'object' || !Object.keys(def).length) {
-        return exports.minimatch;
-    }
-    const orig = exports.minimatch;
-    const m = (p, pattern, options = {}) => orig(p, pattern, ext(def, options));
-    return Object.assign(m, {
-        Minimatch: class Minimatch extends orig.Minimatch {
-            constructor(pattern, options = {}) {
-                super(pattern, ext(def, options));
-            }
-            static defaults(options) {
-                return orig.defaults(ext(def, options)).Minimatch;
-            }
-        },
-        unescape: (s, options = {}) => orig.unescape(s, ext(def, options)),
-        escape: (s, options = {}) => orig.escape(s, ext(def, options)),
-        filter: (pattern, options = {}) => orig.filter(pattern, ext(def, options)),
-        defaults: (options) => orig.defaults(ext(def, options)),
-        makeRe: (pattern, options = {}) => orig.makeRe(pattern, ext(def, options)),
-        braceExpand: (pattern, options = {}) => orig.braceExpand(pattern, ext(def, options)),
-        match: (list, pattern, options = {}) => orig.match(list, pattern, ext(def, options)),
-        sep: orig.sep,
-        GLOBSTAR: exports.GLOBSTAR,
-    });
-};
-exports.defaults = defaults;
-exports.minimatch.defaults = exports.defaults;
-// Brace expansion:
-// a{b,c}d -> abd acd
-// a{b,}c -> abc ac
-// a{0..3}d -> a0d a1d a2d a3d
-// a{b,c{d,e}f}g -> abg acdfg acefg
-// a{b,c}d{e,f}g -> abdeg acdeg abdeg abdfg
-//
-// Invalid sets are not expanded.
-// a{2..}b -> a{2..}b
-// a{b}c -> a{b}c
-const braceExpand = (pattern, options = {}) => {
-    assertValidPattern(pattern);
-    // Thanks to Yeting Li <https://github.com/yetingli> for
-    // improving this regexp to avoid a ReDOS vulnerability.
-    if (options.nobrace || !/\{(?:(?!\{).)*\}/.test(pattern)) {
-        // shortcut. no need to expand.
-        return [pattern];
-    }
-    return (0, brace_expansion_1.default)(pattern);
-};
-exports.braceExpand = braceExpand;
-exports.minimatch.braceExpand = exports.braceExpand;
-const MAX_PATTERN_LENGTH = 1024 * 64;
-const assertValidPattern = (pattern) => {
-    if (typeof pattern !== 'string') {
-        throw new TypeError('invalid pattern');
-    }
-    if (pattern.length > MAX_PATTERN_LENGTH) {
-        throw new TypeError('pattern is too long');
-    }
-};
-// parse a component of the expanded set.
-// At this point, no pattern may contain "/" in it
-// so we're going to return a 2d array, where each entry is the full
-// pattern, split on '/', and then turned into a regular expression.
-// A regexp is made at the end which joins each array with an
-// escaped /, and another full one which joins each regexp with |.
-//
-// Following the lead of Bash 4.1, note that "**" only has special meaning
-// when it is the *only* thing in a path portion.  Otherwise, any series
-// of * is equivalent to a single *.  Globstar behavior is enabled by
-// default, and can be disabled by setting options.noglobstar.
-const makeRe = (pattern, options = {}) => new Minimatch(pattern, options).makeRe();
-exports.makeRe = makeRe;
-exports.minimatch.makeRe = exports.makeRe;
-const match = (list, pattern, options = {}) => {
-    const mm = new Minimatch(pattern, options);
-    list = list.filter(f => mm.match(f));
-    if (mm.options.nonull && !list.length) {
-        list.push(pattern);
-    }
-    return list;
-};
-exports.match = match;
-exports.minimatch.match = exports.match;
-// replace stuff like \* with *
-const globUnescape = (s) => s.replace(/\\(.)/g, '$1');
-const globMagic = /[?*]|[+@!]\(.*?\)|\[|\]/;
-const regExpEscape = (s) => s.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&');
-class Minimatch {
-    options;
-    set;
-    pattern;
-    windowsPathsNoEscape;
-    nonegate;
-    negate;
-    comment;
-    empty;
-    preserveMultipleSlashes;
-    partial;
-    globSet;
-    globParts;
-    nocase;
-    isWindows;
-    platform;
-    windowsNoMagicRoot;
-    regexp;
-    constructor(pattern, options = {}) {
-        assertValidPattern(pattern);
-        options = options || {};
-        this.options = options;
-        this.pattern = pattern;
-        this.platform = options.platform || defaultPlatform;
-        this.isWindows = this.platform === 'win32';
-        this.windowsPathsNoEscape =
-            !!options.windowsPathsNoEscape || options.allowWindowsEscape === false;
-        if (this.windowsPathsNoEscape) {
-            this.pattern = this.pattern.replace(/\\/g, '/');
-        }
-        this.preserveMultipleSlashes = !!options.preserveMultipleSlashes;
-        this.regexp = null;
-        this.negate = false;
-        this.nonegate = !!options.nonegate;
-        this.comment = false;
-        this.empty = false;
-        this.partial = !!options.partial;
-        this.nocase = !!this.options.nocase;
-        this.windowsNoMagicRoot =
-            options.windowsNoMagicRoot !== undefined
-                ? options.windowsNoMagicRoot
-                : !!(this.isWindows && this.nocase);
-        this.globSet = [];
-        this.globParts = [];
-        this.set = [];
-        // make the set of regexps etc.
-        this.make();
-    }
-    hasMagic() {
-        if (this.options.magicalBraces && this.set.length > 1) {
-            return true;
-        }
-        for (const pattern of this.set) {
-            for (const part of pattern) {
-                if (typeof part !== 'string')
-                    return true;
-            }
-        }
-        return false;
-    }
-    debug(..._) { }
-    make() {
-        const pattern = this.pattern;
-        const options = this.options;
-        // empty patterns and comments match nothing.
-        if (!options.nocomment && pattern.charAt(0) === '#') {
-            this.comment = true;
-            return;
-        }
-        if (!pattern) {
-            this.empty = true;
-            return;
-        }
-        // step 1: figure out negation, etc.
-        this.parseNegate();
-        // step 2: expand braces
-        this.globSet = [...new Set(this.braceExpand())];
-        if (options.debug) {
-            this.debug = (...args) => console.error(...args);
-        }
-        this.debug(this.pattern, this.globSet);
-        // step 3: now we have a set, so turn each one into a series of
-        // path-portion matching patterns.
-        // These will be regexps, except in the case of "**", which is
-        // set to the GLOBSTAR object for globstar behavior,
-        // and will not contain any / characters
-        //
-        // First, we preprocess to make the glob pattern sets a bit simpler
-        // and deduped.  There are some perf-killing patterns that can cause
-        // problems with a glob walk, but we can simplify them down a bit.
-        const rawGlobParts = this.globSet.map(s => this.slashSplit(s));
-        this.globParts = this.preprocess(rawGlobParts);
-        this.debug(this.pattern, this.globParts);
-        // glob --> regexps
-        let set = this.globParts.map((s, _, __) => {
-            if (this.isWindows && this.windowsNoMagicRoot) {
-                // check if it's a drive or unc path.
-                const isUNC = s[0] === '' &&
-                    s[1] === '' &&
-                    (s[2] === '?' || !globMagic.test(s[2])) &&
-                    !globMagic.test(s[3]);
-                const isDrive = /^[a-z]:/i.test(s[0]);
-                if (isUNC) {
-                    return [...s.slice(0, 4), ...s.slice(4).map(ss => this.parse(ss))];
-                }
-                else if (isDrive) {
-                    return [s[0], ...s.slice(1).map(ss => this.parse(ss))];
-                }
-            }
-            return s.map(ss => this.parse(ss));
-        });
-        this.debug(this.pattern, set);
-        // filter out everything that didn't compile properly.
-        this.set = set.filter(s => s.indexOf(false) === -1);
-        // do not treat the ? in UNC paths as magic
-        if (this.isWindows) {
-            for (let i = 0; i < this.set.length; i++) {
-                const p = this.set[i];
-                if (p[0] === '' &&
-                    p[1] === '' &&
-                    this.globParts[i][2] === '?' &&
-                    typeof p[3] === 'string' &&
-                    /^[a-z]:$/i.test(p[3])) {
-                    p[2] = '?';
-                }
-            }
-        }
-        this.debug(this.pattern, this.set);
-    }
-    // various transforms to equivalent pattern sets that are
-    // faster to process in a filesystem walk.  The goal is to
-    // eliminate what we can, and push all ** patterns as far
-    // to the right as possible, even if it increases the number
-    // of patterns that we have to process.
-    preprocess(globParts) {
-        // if we're not in globstar mode, then turn all ** into *
-        if (this.options.noglobstar) {
-            for (let i = 0; i < globParts.length; i++) {
-                for (let j = 0; j < globParts[i].length; j++) {
-                    if (globParts[i][j] === '**') {
-                        globParts[i][j] = '*';
-                    }
-                }
-            }
-        }
-        const { optimizationLevel = 1 } = this.options;
-        if (optimizationLevel >= 2) {
-            // aggressive optimization for the purpose of fs walking
-            globParts = this.firstPhasePreProcess(globParts);
-            globParts = this.secondPhasePreProcess(globParts);
-        }
-        else if (optimizationLevel >= 1) {
-            // just basic optimizations to remove some .. parts
-            globParts = this.levelOneOptimize(globParts);
-        }
-        else {
-            globParts = this.adjascentGlobstarOptimize(globParts);
-        }
-        return globParts;
-    }
-    // just get rid of adjascent ** portions
-    adjascentGlobstarOptimize(globParts) {
-        return globParts.map(parts => {
-            let gs = -1;
-            while (-1 !== (gs = parts.indexOf('**', gs + 1))) {
-                let i = gs;
-                while (parts[i + 1] === '**') {
-                    i++;
-                }
-                if (i !== gs) {
-                    parts.splice(gs, i - gs);
-                }
-            }
-            return parts;
-        });
-    }
-    // get rid of adjascent ** and resolve .. portions
-    levelOneOptimize(globParts) {
-        return globParts.map(parts => {
-            parts = parts.reduce((set, part) => {
-                const prev = set[set.length - 1];
-                if (part === '**' && prev === '**') {
-                    return set;
-                }
-                if (part === '..') {
-                    if (prev && prev !== '..' && prev !== '.' && prev !== '**') {
-                        set.pop();
-                        return set;
-                    }
-                }
-                set.push(part);
-                return set;
-            }, []);
-            return parts.length === 0 ? [''] : parts;
-        });
-    }
-    levelTwoFileOptimize(parts) {
-        if (!Array.isArray(parts)) {
-            parts = this.slashSplit(parts);
-        }
-        let didSomething = false;
-        do {
-            didSomething = false;
-            // <pre>/<e>/<rest> -> <pre>/<rest>
-            if (!this.preserveMultipleSlashes) {
-                for (let i = 1; i < parts.length - 1; i++) {
-                    const p = parts[i];
-                    // don't squeeze out UNC patterns
-                    if (i === 1 && p === '' && parts[0] === '')
-                        continue;
-                    if (p === '.' || p === '') {
-                        didSomething = true;
-                        parts.splice(i, 1);
-                        i--;
-                    }
-                }
-                if (parts[0] === '.' &&
-                    parts.length === 2 &&
-                    (parts[1] === '.' || parts[1] === '')) {
-                    didSomething = true;
-                    parts.pop();
-                }
-            }
-            // <pre>/<p>/../<rest> -> <pre>/<rest>
-            let dd = 0;
-            while (-1 !== (dd = parts.indexOf('..', dd + 1))) {
-                const p = parts[dd - 1];
-                if (p && p !== '.' && p !== '..' && p !== '**') {
-                    didSomething = true;
-                    parts.splice(dd - 1, 2);
-                    dd -= 2;
-                }
-            }
-        } while (didSomething);
-        return parts.length === 0 ? [''] : parts;
-    }
-    // First phase: single-pattern processing
-    // <pre> is 1 or more portions
-    // <rest> is 1 or more portions
-    // <p> is any portion other than ., .., '', or **
-    // <e> is . or ''
-    //
-    // **/.. is *brutal* for filesystem walking performance, because
-    // it effectively resets the recursive walk each time it occurs,
-    // and ** cannot be reduced out by a .. pattern part like a regexp
-    // or most strings (other than .., ., and '') can be.
-    //
-    // <pre>/**/../<p>/<p>/<rest> -> {<pre>/../<p>/<p>/<rest>,<pre>/**/<p>/<p>/<rest>}
-    // <pre>/<e>/<rest> -> <pre>/<rest>
-    // <pre>/<p>/../<rest> -> <pre>/<rest>
-    // **/**/<rest> -> **/<rest>
-    //
-    // **/*/<rest> -> */**/<rest> <== not valid because ** doesn't follow
-    // this WOULD be allowed if ** did follow symlinks, or * didn't
-    firstPhasePreProcess(globParts) {
-        let didSomething = false;
-        do {
-            didSomething = false;
-            // <pre>/**/../<p>/<p>/<rest> -> {<pre>/../<p>/<p>/<rest>,<pre>/**/<p>/<p>/<rest>}
-            for (let parts of globParts) {
-                let gs = -1;
-                while (-1 !== (gs = parts.indexOf('**', gs + 1))) {
-                    let gss = gs;
-                    while (parts[gss + 1] === '**') {
-                        // <pre>/**/**/<rest> -> <pre>/**/<rest>
-                        gss++;
-                    }
-                    // eg, if gs is 2 and gss is 4, that means we have 3 **
-                    // parts, and can remove 2 of them.
-                    if (gss > gs) {
-                        parts.splice(gs + 1, gss - gs);
-                    }
-                    let next = parts[gs + 1];
-                    const p = parts[gs + 2];
-                    const p2 = parts[gs + 3];
-                    if (next !== '..')
-                        continue;
-                    if (!p ||
-                        p === '.' ||
-                        p === '..' ||
-                        !p2 ||
-                        p2 === '.' ||
-                        p2 === '..') {
-                        continue;
-                    }
-                    didSomething = true;
-                    // edit parts in place, and push the new one
-                    parts.splice(gs, 1);
-                    const other = parts.slice(0);
-                    other[gs] = '**';
-                    globParts.push(other);
-                    gs--;
-                }
-                // <pre>/<e>/<rest> -> <pre>/<rest>
-                if (!this.preserveMultipleSlashes) {
-                    for (let i = 1; i < parts.length - 1; i++) {
-                        const p = parts[i];
-                        // don't squeeze out UNC patterns
-                        if (i === 1 && p === '' && parts[0] === '')
-                            continue;
-                        if (p === '.' || p === '') {
-                            didSomething = true;
-                            parts.splice(i, 1);
-                            i--;
-                        }
-                    }
-                    if (parts[0] === '.' &&
-                        parts.length === 2 &&
-                        (parts[1] === '.' || parts[1] === '')) {
-                        didSomething = true;
-                        parts.pop();
-                    }
-                }
-                // <pre>/<p>/../<rest> -> <pre>/<rest>
-                let dd = 0;
-                while (-1 !== (dd = parts.indexOf('..', dd + 1))) {
-                    const p = parts[dd - 1];
-                    if (p && p !== '.' && p !== '..' && p !== '**') {
-                        didSomething = true;
-                        const needDot = dd === 1 && parts[dd + 1] === '**';
-                        const splin = needDot ? ['.'] : [];
-                        parts.splice(dd - 1, 2, ...splin);
-                        if (parts.length === 0)
-                            parts.push('');
-                        dd -= 2;
-                    }
-                }
-            }
-        } while (didSomething);
-        return globParts;
-    }
-    // second phase: multi-pattern dedupes
-    // {<pre>/*/<rest>,<pre>/<p>/<rest>} -> <pre>/*/<rest>
-    // {<pre>/<rest>,<pre>/<rest>} -> <pre>/<rest>
-    // {<pre>/**/<rest>,<pre>/<rest>} -> <pre>/**/<rest>
-    //
-    // {<pre>/**/<rest>,<pre>/**/<p>/<rest>} -> <pre>/**/<rest>
-    // ^-- not valid because ** doens't follow symlinks
-    secondPhasePreProcess(globParts) {
-        for (let i = 0; i < globParts.length - 1; i++) {
-            for (let j = i + 1; j < globParts.length; j++) {
-                const matched = this.partsMatch(globParts[i], globParts[j], !this.preserveMultipleSlashes);
-                if (!matched)
-                    continue;
-                globParts[i] = matched;
-                globParts[j] = [];
-            }
-        }
-        return globParts.filter(gs => gs.length);
-    }
-    partsMatch(a, b, emptyGSMatch = false) {
-        let ai = 0;
-        let bi = 0;
-        let result = [];
-        let which = '';
-        while (ai < a.length && bi < b.length) {
-            if (a[ai] === b[bi]) {
-                result.push(which === 'b' ? b[bi] : a[ai]);
-                ai++;
-                bi++;
-            }
-            else if (emptyGSMatch && a[ai] === '**' && b[bi] === a[ai + 1]) {
-                result.push(a[ai]);
-                ai++;
-            }
-            else if (emptyGSMatch && b[bi] === '**' && a[ai] === b[bi + 1]) {
-                result.push(b[bi]);
-                bi++;
-            }
-            else if (a[ai] === '*' &&
-                b[bi] &&
-                (this.options.dot || !b[bi].startsWith('.')) &&
-                b[bi] !== '**') {
-                if (which === 'b')
-                    return false;
-                which = 'a';
-                result.push(a[ai]);
-                ai++;
-                bi++;
-            }
-            else if (b[bi] === '*' &&
-                a[ai] &&
-                (this.options.dot || !a[ai].startsWith('.')) &&
-                a[ai] !== '**') {
-                if (which === 'a')
-                    return false;
-                which = 'b';
-                result.push(b[bi]);
-                ai++;
-                bi++;
-            }
-            else {
-                return false;
-            }
-        }
-        // if we fall out of the loop, it means they two are identical
-        // as long as their lengths match
-        return a.length === b.length && result;
-    }
-    parseNegate() {
-        if (this.nonegate)
-            return;
-        const pattern = this.pattern;
-        let negate = false;
-        let negateOffset = 0;
-        for (let i = 0; i < pattern.length && pattern.charAt(i) === '!'; i++) {
-            negate = !negate;
-            negateOffset++;
-        }
-        if (negateOffset)
-            this.pattern = pattern.slice(negateOffset);
-        this.negate = negate;
-    }
-    // set partial to true to test if, for example,
-    // "/a/b" matches the start of "/*/b/*/d"
-    // Partial means, if you run out of file before you run
-    // out of pattern, then that's fine, as long as all
-    // the parts match.
-    matchOne(file, pattern, partial = false) {
-        const options = this.options;
-        // a UNC pattern like //?/c:/* can match a path like c:/x
-        // and vice versa
-        if (this.isWindows) {
-            const fileUNC = file[0] === '' &&
-                file[1] === '' &&
-                file[2] === '?' &&
-                typeof file[3] === 'string' &&
-                /^[a-z]:$/i.test(file[3]);
-            const patternUNC = pattern[0] === '' &&
-                pattern[1] === '' &&
-                pattern[2] === '?' &&
-                typeof pattern[3] === 'string' &&
-                /^[a-z]:$/i.test(pattern[3]);
-            if (fileUNC && patternUNC) {
-                const fd = file[3];
-                const pd = pattern[3];
-                if (fd.toLowerCase() === pd.toLowerCase()) {
-                    file[3] = pd;
-                }
-            }
-            else if (patternUNC && typeof file[0] === 'string') {
-                const pd = pattern[3];
-                const fd = file[0];
-                if (pd.toLowerCase() === fd.toLowerCase()) {
-                    pattern[3] = fd;
-                    pattern = pattern.slice(3);
-                }
-            }
-            else if (fileUNC && typeof pattern[0] === 'string') {
-                const fd = file[3];
-                if (fd.toLowerCase() === pattern[0].toLowerCase()) {
-                    pattern[0] = fd;
-                    file = file.slice(3);
-                }
-            }
-        }
-        // resolve and reduce . and .. portions in the file as well.
-        // dont' need to do the second phase, because it's only one string[]
-        const { optimizationLevel = 1 } = this.options;
-        if (optimizationLevel >= 2) {
-            file = this.levelTwoFileOptimize(file);
-        }
-        this.debug('matchOne', this, { file, pattern });
-        this.debug('matchOne', file.length, pattern.length);
-        for (var fi = 0, pi = 0, fl = file.length, pl = pattern.length; fi < fl && pi < pl; fi++, pi++) {
-            this.debug('matchOne loop');
-            var p = pattern[pi];
-            var f = file[fi];
-            this.debug(pattern, p, f);
-            // should be impossible.
-            // some invalid regexp stuff in the set.
-            /* c8 ignore start */
-            if (p === false) {
-                return false;
-            }
-            /* c8 ignore stop */
-            if (p === exports.GLOBSTAR) {
-                this.debug('GLOBSTAR', [pattern, p, f]);
-                // "**"
-                // a/**/b/**/c would match the following:
-                // a/b/x/y/z/c
-                // a/x/y/z/b/c
-                // a/b/x/b/x/c
-                // a/b/c
-                // To do this, take the rest of the pattern after
-                // the **, and see if it would match the file remainder.
-                // If so, return success.
-                // If not, the ** "swallows" a segment, and try again.
-                // This is recursively awful.
-                //
-                // a/**/b/**/c matching a/b/x/y/z/c
-                // - a matches a
-                // - doublestar
-                //   - matchOne(b/x/y/z/c, b/**/c)
-                //     - b matches b
-                //     - doublestar
-                //       - matchOne(x/y/z/c, c) -> no
-                //       - matchOne(y/z/c, c) -> no
-                //       - matchOne(z/c, c) -> no
-                //       - matchOne(c, c) yes, hit
-                var fr = fi;
-                var pr = pi + 1;
-                if (pr === pl) {
-                    this.debug('** at the end');
-                    // a ** at the end will just swallow the rest.
-                    // We have found a match.
-                    // however, it will not swallow /.x, unless
-                    // options.dot is set.
-                    // . and .. are *never* matched by **, for explosively
-                    // exponential reasons.
-                    for (; fi < fl; fi++) {
-                        if (file[fi] === '.' ||
-                            file[fi] === '..' ||
-                            (!options.dot && file[fi].charAt(0) === '.'))
-                            return false;
-                    }
-                    return true;
-                }
-                // ok, let's see if we can swallow whatever we can.
-                while (fr < fl) {
-                    var swallowee = file[fr];
-                    this.debug('\nglobstar while', file, fr, pattern, pr, swallowee);
-                    // XXX remove this slice.  Just pass the start index.
-                    if (this.matchOne(file.slice(fr), pattern.slice(pr), partial)) {
-                        this.debug('globstar found match!', fr, fl, swallowee);
-                        // found a match.
-                        return true;
-                    }
-                    else {
-                        // can't swallow "." or ".." ever.
-                        // can only swallow ".foo" when explicitly asked.
-                        if (swallowee === '.' ||
-                            swallowee === '..' ||
-                            (!options.dot && swallowee.charAt(0) === '.')) {
-                            this.debug('dot detected!', file, fr, pattern, pr);
-                            break;
-                        }
-                        // ** swallows a segment, and continue.
-                        this.debug('globstar swallow a segment, and continue');
-                        fr++;
-                    }
-                }
-                // no match was found.
-                // However, in partial mode, we can't say this is necessarily over.
-                /* c8 ignore start */
-                if (partial) {
-                    // ran out of file
-                    this.debug('\n>>> no match, partial?', file, fr, pattern, pr);
-                    if (fr === fl) {
-                        return true;
-                    }
-                }
-                /* c8 ignore stop */
-                return false;
-            }
-            // something other than **
-            // non-magic patterns just have to match exactly
-            // patterns with magic have been turned into regexps.
-            let hit;
-            if (typeof p === 'string') {
-                hit = f === p;
-                this.debug('string match', p, f, hit);
-            }
-            else {
-                hit = p.test(f);
-                this.debug('pattern match', p, f, hit);
-            }
-            if (!hit)
-                return false;
-        }
-        // Note: ending in / means that we'll get a final ""
-        // at the end of the pattern.  This can only match a
-        // corresponding "" at the end of the file.
-        // If the file ends in /, then it can only match a
-        // a pattern that ends in /, unless the pattern just
-        // doesn't have any more for it. But, a/b/ should *not*
-        // match "a/b/*", even though "" matches against the
-        // [^/]*? pattern, except in partial mode, where it might
-        // simply not be reached yet.
-        // However, a/b/ should still satisfy a/*
-        // now either we fell off the end of the pattern, or we're done.
-        if (fi === fl && pi === pl) {
-            // ran out of pattern and filename at the same time.
-            // an exact hit!
-            return true;
-        }
-        else if (fi === fl) {
-            // ran out of file, but still had pattern left.
-            // this is ok if we're doing the match as part of
-            // a glob fs traversal.
-            return partial;
-        }
-        else if (pi === pl) {
-            // ran out of pattern, still have file left.
-            // this is only acceptable if we're on the very last
-            // empty segment of a file with a trailing slash.
-            // a/* should match a/b/
-            return fi === fl - 1 && file[fi] === '';
-            /* c8 ignore start */
-        }
-        else {
-            // should be unreachable.
-            throw new Error('wtf?');
-        }
-        /* c8 ignore stop */
-    }
-    braceExpand() {
-        return (0, exports.braceExpand)(this.pattern, this.options);
-    }
-    parse(pattern) {
-        assertValidPattern(pattern);
-        const options = this.options;
-        // shortcuts
-        if (pattern === '**')
-            return exports.GLOBSTAR;
-        if (pattern === '')
-            return '';
-        // far and away, the most common glob pattern parts are
-        // *, *.*, and *.<ext>  Add a fast check method for those.
-        let m;
-        let fastTest = null;
-        if ((m = pattern.match(starRE))) {
-            fastTest = options.dot ? starTestDot : starTest;
-        }
-        else if ((m = pattern.match(starDotExtRE))) {
-            fastTest = (options.nocase
-                ? options.dot
-                    ? starDotExtTestNocaseDot
-                    : starDotExtTestNocase
-                : options.dot
-                    ? starDotExtTestDot
-                    : starDotExtTest)(m[1]);
-        }
-        else if ((m = pattern.match(qmarksRE))) {
-            fastTest = (options.nocase
-                ? options.dot
-                    ? qmarksTestNocaseDot
-                    : qmarksTestNocase
-                : options.dot
-                    ? qmarksTestDot
-                    : qmarksTest)(m);
-        }
-        else if ((m = pattern.match(starDotStarRE))) {
-            fastTest = options.dot ? starDotStarTestDot : starDotStarTest;
-        }
-        else if ((m = pattern.match(dotStarRE))) {
-            fastTest = dotStarTest;
-        }
-        let re = '';
-        let hasMagic = false;
-        let escaping = false;
-        // ? => one single character
-        const patternListStack = [];
-        const negativeLists = [];
-        let stateChar = false;
-        let uflag = false;
-        let pl;
-        // . and .. never match anything that doesn't start with .,
-        // even when options.dot is set.  However, if the pattern
-        // starts with ., then traversal patterns can match.
-        let dotTravAllowed = pattern.charAt(0) === '.';
-        let dotFileAllowed = options.dot || dotTravAllowed;
-        const patternStart = () => dotTravAllowed
-            ? ''
-            : dotFileAllowed
-                ? '(?!(?:^|\\/)\\.{1,2}(?:$|\\/))'
-                : '(?!\\.)';
-        const subPatternStart = (p) => p.charAt(0) === '.'
-            ? ''
-            : options.dot
-                ? '(?!(?:^|\\/)\\.{1,2}(?:$|\\/))'
-                : '(?!\\.)';
-        const clearStateChar = () => {
-            if (stateChar) {
-                // we had some state-tracking character
-                // that wasn't consumed by this pass.
-                switch (stateChar) {
-                    case '*':
-                        re += star;
-                        hasMagic = true;
-                        break;
-                    case '?':
-                        re += qmark;
-                        hasMagic = true;
-                        break;
-                    default:
-                        re += '\\' + stateChar;
-                        break;
-                }
-                this.debug('clearStateChar %j %j', stateChar, re);
-                stateChar = false;
-            }
-        };
-        for (let i = 0, c; i < pattern.length && (c = pattern.charAt(i)); i++) {
-            this.debug('%s\t%s %s %j', pattern, i, re, c);
-            // skip over any that are escaped.
-            if (escaping) {
-                // completely not allowed, even escaped.
-                // should be impossible.
-                /* c8 ignore start */
-                if (c === '/') {
-                    return false;
-                }
-                /* c8 ignore stop */
-                if (reSpecials[c]) {
-                    re += '\\';
-                }
-                re += c;
-                escaping = false;
-                continue;
-            }
-            switch (c) {
-                // Should already be path-split by now.
-                /* c8 ignore start */
-                case '/': {
-                    return false;
-                }
-                /* c8 ignore stop */
-                case '\\':
-                    clearStateChar();
-                    escaping = true;
-                    continue;
-                // the various stateChar values
-                // for the "extglob" stuff.
-                case '?':
-                case '*':
-                case '+':
-                case '@':
-                case '!':
-                    this.debug('%s\t%s %s %j <-- stateChar', pattern, i, re, c);
-                    // if we already have a stateChar, then it means
-                    // that there was something like ** or +? in there.
-                    // Handle the stateChar, then proceed with this one.
-                    this.debug('call clearStateChar %j', stateChar);
-                    clearStateChar();
-                    stateChar = c;
-                    // if extglob is disabled, then +(asdf|foo) isn't a thing.
-                    // just clear the statechar *now*, rather than even diving into
-                    // the patternList stuff.
-                    if (options.noext)
-                        clearStateChar();
-                    continue;
-                case '(': {
-                    if (!stateChar) {
-                        re += '\\(';
-                        continue;
-                    }
-                    const plEntry = {
-                        type: stateChar,
-                        start: i - 1,
-                        reStart: re.length,
-                        open: plTypes[stateChar].open,
-                        close: plTypes[stateChar].close,
-                    };
-                    this.debug(this.pattern, '\t', plEntry);
-                    patternListStack.push(plEntry);
-                    // negation is (?:(?!(?:js)(?:<rest>))[^/]*)
-                    re += plEntry.open;
-                    // next entry starts with a dot maybe?
-                    if (plEntry.start === 0 && plEntry.type !== '!') {
-                        dotTravAllowed = true;
-                        re += subPatternStart(pattern.slice(i + 1));
-                    }
-                    this.debug('plType %j %j', stateChar, re);
-                    stateChar = false;
-                    continue;
-                }
-                case ')': {
-                    const plEntry = patternListStack[patternListStack.length - 1];
-                    if (!plEntry) {
-                        re += '\\)';
-                        continue;
-                    }
-                    patternListStack.pop();
-                    // closing an extglob
-                    clearStateChar();
-                    hasMagic = true;
-                    pl = plEntry;
-                    // negation is (?:(?!js)[^/]*)
-                    // The others are (?:<pattern>)<type>
-                    re += pl.close;
-                    if (pl.type === '!') {
-                        negativeLists.push(Object.assign(pl, { reEnd: re.length }));
-                    }
-                    continue;
-                }
-                case '|': {
-                    const plEntry = patternListStack[patternListStack.length - 1];
-                    if (!plEntry) {
-                        re += '\\|';
-                        continue;
-                    }
-                    clearStateChar();
-                    re += '|';
-                    // next subpattern can start with a dot?
-                    if (plEntry.start === 0 && plEntry.type !== '!') {
-                        dotTravAllowed = true;
-                        re += subPatternStart(pattern.slice(i + 1));
-                    }
-                    continue;
-                }
-                // these are mostly the same in regexp and glob
-                case '[':
-                    // swallow any state-tracking char before the [
-                    clearStateChar();
-                    const [src, needUflag, consumed, magic] = (0, brace_expressions_js_1.parseClass)(pattern, i);
-                    if (consumed) {
-                        re += src;
-                        uflag = uflag || needUflag;
-                        i += consumed - 1;
-                        hasMagic = hasMagic || magic;
-                    }
-                    else {
-                        re += '\\[';
-                    }
-                    continue;
-                case ']':
-                    re += '\\' + c;
-                    continue;
-                default:
-                    // swallow any state char that wasn't consumed
-                    clearStateChar();
-                    re += regExpEscape(c);
-                    break;
-            } // switch
-        } // for
-        // handle the case where we had a +( thing at the *end*
-        // of the pattern.
-        // each pattern list stack adds 3 chars, and we need to go through
-        // and escape any | chars that were passed through as-is for the regexp.
-        // Go through and escape them, taking care not to double-escape any
-        // | chars that were already escaped.
-        for (pl = patternListStack.pop(); pl; pl = patternListStack.pop()) {
-            let tail;
-            tail = re.slice(pl.reStart + pl.open.length);
-            this.debug(this.pattern, 'setting tail', re, pl);
-            // maybe some even number of \, then maybe 1 \, followed by a |
-            tail = tail.replace(/((?:\\{2}){0,64})(\\?)\|/g, (_, $1, $2) => {
-                if (!$2) {
-                    // the | isn't already escaped, so escape it.
-                    $2 = '\\';
-                    // should already be done
-                    /* c8 ignore start */
-                }
-                /* c8 ignore stop */
-                // need to escape all those slashes *again*, without escaping the
-                // one that we need for escaping the | character.  As it works out,
-                // escaping an even number of slashes can be done by simply repeating
-                // it exactly after itself.  That's why this trick works.
-                //
-                // I am sorry that you have to see this.
-                return $1 + $1 + $2 + '|';
-            });
-            this.debug('tail=%j\n   %s', tail, tail, pl, re);
-            const t = pl.type === '*' ? star : pl.type === '?' ? qmark : '\\' + pl.type;
-            hasMagic = true;
-            re = re.slice(0, pl.reStart) + t + '\\(' + tail;
-        }
-        // handle trailing things that only matter at the very end.
-        clearStateChar();
-        if (escaping) {
-            // trailing \\
-            re += '\\\\';
-        }
-        // only need to apply the nodot start if the re starts with
-        // something that could conceivably capture a dot
-        const addPatternStart = addPatternStartSet[re.charAt(0)];
-        // Hack to work around lack of negative lookbehind in JS
-        // A pattern like: *.!(x).!(y|z) needs to ensure that a name
-        // like 'a.xyz.yz' doesn't match.  So, the first negative
-        // lookahead, has to look ALL the way ahead, to the end of
-        // the pattern.
-        for (let n = negativeLists.length - 1; n > -1; n--) {
-            const nl = negativeLists[n];
-            const nlBefore = re.slice(0, nl.reStart);
-            const nlFirst = re.slice(nl.reStart, nl.reEnd - 8);
-            let nlAfter = re.slice(nl.reEnd);
-            const nlLast = re.slice(nl.reEnd - 8, nl.reEnd) + nlAfter;
-            // Handle nested stuff like *(*.js|!(*.json)), where open parens
-            // mean that we should *not* include the ) in the bit that is considered
-            // "after" the negated section.
-            const closeParensBefore = nlBefore.split(')').length;
-            const openParensBefore = nlBefore.split('(').length - closeParensBefore;
-            let cleanAfter = nlAfter;
-            for (let i = 0; i < openParensBefore; i++) {
-                cleanAfter = cleanAfter.replace(/\)[+*?]?/, '');
-            }
-            nlAfter = cleanAfter;
-            const dollar = nlAfter === '' ? '(?:$|\\/)' : '';
-            re = nlBefore + nlFirst + nlAfter + dollar + nlLast;
-        }
-        // if the re is not "" at this point, then we need to make sure
-        // it doesn't match against an empty path part.
-        // Otherwise a/* will match a/, which it should not.
-        if (re !== '' && hasMagic) {
-            re = '(?=.)' + re;
-        }
-        if (addPatternStart) {
-            re = patternStart() + re;
-        }
-        // if it's nocase, and the lcase/uppercase don't match, it's magic
-        if (options.nocase && !hasMagic && !options.nocaseMagicOnly) {
-            hasMagic = pattern.toUpperCase() !== pattern.toLowerCase();
-        }
-        // skip the regexp for non-magical patterns
-        // unescape anything in it, though, so that it'll be
-        // an exact match against a file etc.
-        if (!hasMagic) {
-            return globUnescape(re);
-        }
-        const flags = (options.nocase ? 'i' : '') + (uflag ? 'u' : '');
-        try {
-            const ext = fastTest
-                ? {
-                    _glob: pattern,
-                    _src: re,
-                    test: fastTest,
-                }
-                : {
-                    _glob: pattern,
-                    _src: re,
-                };
-            return Object.assign(new RegExp('^' + re + '$', flags), ext);
-            /* c8 ignore start */
-        }
-        catch (er) {
-            // should be impossible
-            // If it was an invalid regular expression, then it can't match
-            // anything.  This trick looks for a character after the end of
-            // the string, which is of course impossible, except in multi-line
-            // mode, but it's not a /m regex.
-            this.debug('invalid regexp', er);
-            return new RegExp('$.');
-        }
-        /* c8 ignore stop */
-    }
-    makeRe() {
-        if (this.regexp || this.regexp === false)
-            return this.regexp;
-        // at this point, this.set is a 2d array of partial
-        // pattern strings, or "**".
-        //
-        // It's better to use .match().  This function shouldn't
-        // be used, really, but it's pretty convenient sometimes,
-        // when you just want to work with a regex.
-        const set = this.set;
-        if (!set.length) {
-            this.regexp = false;
-            return this.regexp;
-        }
-        const options = this.options;
-        const twoStar = options.noglobstar
-            ? star
-            : options.dot
-                ? twoStarDot
-                : twoStarNoDot;
-        const flags = options.nocase ? 'i' : '';
-        // regexpify non-globstar patterns
-        // if ** is only item, then we just do one twoStar
-        // if ** is first, and there are more, prepend (\/|twoStar\/)? to next
-        // if ** is last, append (\/twoStar|) to previous
-        // if ** is in the middle, append (\/|\/twoStar\/) to previous
-        // then filter out GLOBSTAR symbols
-        let re = set
-            .map(pattern => {
-            const pp = pattern.map(p => typeof p === 'string'
-                ? regExpEscape(p)
-                : p === exports.GLOBSTAR
-                    ? exports.GLOBSTAR
-                    : p._src);
-            pp.forEach((p, i) => {
-                const next = pp[i + 1];
-                const prev = pp[i - 1];
-                if (p !== exports.GLOBSTAR || prev === exports.GLOBSTAR) {
-                    return;
-                }
-                if (prev === undefined) {
-                    if (next !== undefined && next !== exports.GLOBSTAR) {
-                        pp[i + 1] = '(?:\\/|' + twoStar + '\\/)?' + next;
-                    }
-                    else {
-                        pp[i] = twoStar;
-                    }
-                }
-                else if (next === undefined) {
-                    pp[i - 1] = prev + '(?:\\/|' + twoStar + ')?';
-                }
-                else if (next !== exports.GLOBSTAR) {
-                    pp[i - 1] = prev + '(?:\\/|\\/' + twoStar + '\\/)' + next;
-                    pp[i + 1] = exports.GLOBSTAR;
-                }
-            });
-            return pp.filter(p => p !== exports.GLOBSTAR).join('/');
-        })
-            .join('|');
-        // must match entire pattern
-        // ending in a * or ** will make it less strict.
-        re = '^(?:' + re + ')$';
-        // can match anything, as long as it's not this.
-        if (this.negate)
-            re = '^(?!' + re + ').*$';
-        try {
-            this.regexp = new RegExp(re, flags);
-            /* c8 ignore start */
-        }
-        catch (ex) {
-            // should be impossible
-            this.regexp = false;
-        }
-        /* c8 ignore stop */
-        return this.regexp;
-    }
-    slashSplit(p) {
-        // if p starts with // on windows, we preserve that
-        // so that UNC paths aren't broken.  Otherwise, any number of
-        // / characters are coalesced into one, unless
-        // preserveMultipleSlashes is set to true.
-        if (this.preserveMultipleSlashes) {
-            return p.split('/');
-        }
-        else if (this.isWindows && /^\/\/[^\/]+/.test(p)) {
-            // add an extra '' for the one we lose
-            return ['', ...p.split(/\/+/)];
-        }
-        else {
-            return p.split(/\/+/);
-        }
-    }
-    match(f, partial = this.partial) {
-        this.debug('match', f, this.pattern);
-        // short-circuit in the case of busted things.
-        // comments, etc.
-        if (this.comment) {
-            return false;
-        }
-        if (this.empty) {
-            return f === '';
-        }
-        if (f === '/' && partial) {
-            return true;
-        }
-        const options = this.options;
-        // windows: need to use /, not \
-        if (this.isWindows) {
-            f = f.split('\\').join('/');
-        }
-        // treat the test path as a set of pathparts.
-        const ff = this.slashSplit(f);
-        this.debug(this.pattern, 'split', ff);
-        // just ONE of the pattern sets in this.set needs to match
-        // in order for it to be valid.  If negating, then just one
-        // match means that we have failed.
-        // Either way, return on the first hit.
-        const set = this.set;
-        this.debug(this.pattern, 'set', set);
-        // Find the basename of the path by looking for the last non-empty segment
-        let filename = ff[ff.length - 1];
-        if (!filename) {
-            for (let i = ff.length - 2; !filename && i >= 0; i--) {
-                filename = ff[i];
-            }
-        }
-        for (let i = 0; i < set.length; i++) {
-            const pattern = set[i];
-            let file = ff;
-            if (options.matchBase && pattern.length === 1) {
-                file = [filename];
-            }
-            const hit = this.matchOne(file, pattern, partial);
-            if (hit) {
-                if (options.flipNegate) {
-                    return true;
-                }
-                return !this.negate;
-            }
-        }
-        // didn't get any hits.  this is success if it's a negative
-        // pattern, failure otherwise.
-        if (options.flipNegate) {
-            return false;
-        }
-        return this.negate;
-    }
-    static defaults(def) {
-        return exports.minimatch.defaults(def).Minimatch;
-    }
-}
-exports.Minimatch = Minimatch;
-/* c8 ignore start */
-var escape_js_2 = __nccwpck_require__(9004);
-Object.defineProperty(exports, "escape", ({ enumerable: true, get: function () { return escape_js_2.escape; } }));
-var unescape_js_2 = __nccwpck_require__(7305);
-Object.defineProperty(exports, "unescape", ({ enumerable: true, get: function () { return unescape_js_2.unescape; } }));
-/* c8 ignore stop */
-exports.minimatch.Minimatch = Minimatch;
-exports.minimatch.escape = escape_js_1.escape;
-exports.minimatch.unescape = unescape_js_1.unescape;
-//# sourceMappingURL=index.js.map
-
-/***/ }),
-
-/***/ 7305:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.unescape = void 0;
-/**
- * Un-escape a string that has been escaped with {@link escape}.
- *
- * If the {@link windowsPathsNoEscape} option is used, then square-brace
- * escapes are removed, but not backslash escapes.  For example, it will turn
- * the string `'[*]'` into `*`, but it will not turn `'\\*'` into `'*'`,
- * becuase `\` is a path separator in `windowsPathsNoEscape` mode.
- *
- * When `windowsPathsNoEscape` is not set, then both brace escapes and
- * backslash escapes are removed.
- *
- * Slashes (and backslashes in `windowsPathsNoEscape` mode) cannot be escaped
- * or unescaped.
- */
-const unescape = (s, { windowsPathsNoEscape = false, } = {}) => {
-    return windowsPathsNoEscape
-        ? s.replace(/\[([^\/\\])\]/g, '$1')
-        : s.replace(/((?!\\).|^)\[([^\/\\])\]/g, '$1$2').replace(/\\([^\/])/g, '$1');
-};
-exports.unescape = unescape;
-//# sourceMappingURL=unescape.js.map
 
 /***/ }),
 
