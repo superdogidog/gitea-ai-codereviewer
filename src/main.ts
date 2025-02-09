@@ -64,7 +64,7 @@ async function getDiff(
     `${GITEA_API_URL}/api/v1/repos/${owner}/${repo}/pulls/${pull_number}.diff`,
     {
       headers: {
-        Authorization: `token ${GITEA_TOKEN}`,
+        Authorization: `Bearer ${GITEA_TOKEN}`,
       },
     }
   );

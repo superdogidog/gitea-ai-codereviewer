@@ -94,7 +94,7 @@ function getDiff(owner, repo, pull_number) {
     return __awaiter(this, void 0, void 0, function* () {
         const response = yield (0, cross_fetch_1.fetch)(`${GITEA_API_URL}/api/v1/repos/${owner}/${repo}/pulls/${pull_number}.diff`, {
             headers: {
-                Authorization: `token ${GITEA_TOKEN}`,
+                Authorization: `Bearer ${GITEA_TOKEN}`,
             },
         });
         console.log("Response:", response);
